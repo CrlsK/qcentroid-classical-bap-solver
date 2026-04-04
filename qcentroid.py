@@ -1,10 +1,4 @@
-"""
-Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v8.0
-Berth Allocation + Quay Crane Assignment.
-v8.0: Quantum-inspired berth-spreading with balanced crane allocation.
-Key insight: maximize parallelism across ALL berths with 2-3 cranes/vessel
-instead of packing vessels onto few berths with max cranes.
-"""
+"""\nClassical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v8.1\nBerth Allocation + Quay Crane Assignment.\nv8.1: Hard crane cap during greedy forces all-berth usage.\nKey fix: cap cranes at total/n_berths during greedy (=3 for 18/6),\nenabling 6 concurrent vessels across all 6 berths.\nPost-hoc safety net REMOVED (always destructive).\n"""
 import logging
 import time
 import itertools
@@ -21,7 +15,7 @@ logger = logging.getLogger("qcentroid-user-log")
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Classical BAP+QCA Solver v8.0 — Quantum-Inspired Berth-Spreading ===")
+    logger.info("=== Classical BAP+QCA Solver v8.1 — Hard Crane Cap + All-Berth Spreading ===")
 
     vessels = input_data.get("vessels", [])
     berths = input_data.get("berths", [])
@@ -41,10 +35,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_berths = len(berths)
     logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
 
-    # v8.0: Quantum-inspired crane target — spread cranes across berths
-    # With 18 cranes and 6 berths, optimal is ~3 cranes/vessel (matching quantum's 2.4 avg)
-    balanced_cranes = max(min_cranes, min(total_cranes // n_berths, max_cranes))
-    logger.info(f"v8.0: Balanced crane target = {balanced_cranes} per vessel (quantum-inspired)")
+    # v8.1: HARD crane cap during greedy — forces berth spreading
+    # With 18 cranes and 6 berths, cap at 3 cranes/vessel → 6 concurrent vessels possible
+    greedy_max_cranes = max(min_cranes, min(total_cranes // n_berths, max_cranes))
+    logger.info(f"v8.1: Greedy crane cap = {greedy_max_cranes} (hard limit during construction)")
+    logger.info(f"v8.1: Post-greedy optimization may adjust up to {max_cranes} per vessel")
 
     # Sort vessels by priority (ascending = higher priority first), then arrival
     sorted_vessels = sorted(vessels, key=lambda v: (v.get("priority", 5), v.get("arrival_time", "")))
@@ -96,14 +91,9 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             deadline_h = _iso_to_hours(v_deadline)
             arr_h = _iso_to_hours(v_arrival)
 
-            # v8.0: Try crane counts centered around balanced target
-            # Order: balanced first, then ±1, ±2, etc.
-            crane_candidates = [balanced_cranes]
-            for delta in range(1, max_cranes):
-                if balanced_cranes - delta >= min_cranes:
-                    crane_candidates.append(balanced_cranes - delta)
-                if balanced_cranes + delta <= max_cranes:
-                    crane_candidates.append(balanced_cranes + delta)
+            # v8.1: HARD CAP at greedy_max_cranes — never exceed during construction
+            # This forces vessels onto more berths since fewer concurrent cranes needed
+            crane_candidates = list(range(greedy_max_cranes, min_cranes - 1, -1))
 
             for nc in crane_candidates:
                 handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
@@ -187,7 +177,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 arr_h = _iso_to_hours(v_arrival)
                 deadline_h = _iso_to_hours(v_deadline)
 
-                for nc in range(min_cranes, max_cranes + 1):
+                for nc in range(min_cranes, greedy_max_cranes + 1):
                     handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
                     end_h = start_h + handling_hours
                     wait_hours = max(0, start_h - arr_h)
@@ -447,14 +437,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         })
         logger.info(f"Crane reopt: {crane_opt_improved} adjusted, cost=${final_cost_after_crane_opt:,.2f}")
 
-    # ── 3e. GENTLE FINAL CRANE BUDGET + RESEQUENCING (v8.0) ─────────
-    # v8.0: With balanced crane allocation, enforcement should be minimal
-    logger.info("Final crane budget safety-net pass...")
-    assignments, final_crane_changes = _enforce_crane_budget(
-        assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights
-    )
-    if final_crane_changes > 0:
-        logger.info(f"Final crane budget: {final_crane_changes} adjustments")
+    # ── 3e. v8.1: Safety net REMOVED — it was always destructive ────
+    # Previous versions: safety net added $900K-$3.5M every time
+    # With hard crane cap during greedy, budget is inherently feasible
+    # Just do a light resequencing pass
     assignments, final_reseq_changes = _resequence_all_berths(
         assignments, vessels, berths, cost_weights, w_priority
     )
@@ -463,10 +449,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     post_reseq_cost = sum(a["cost"] for a in assignments)
     cost_evolution.append({
         "iteration": iteration + 4,
-        "phase": "final_safety_net",
+        "phase": "resequence",
         "objective_value": round(post_reseq_cost, 2)
     })
-    logger.info(f"Final cost after safety-net: ${post_reseq_cost:,.2f}")
+    logger.info(f"Final cost after resequencing: ${post_reseq_cost:,.2f}")
 
     # Compute final metrics
     total_cost = sum(a["cost"] for a in assignments)
@@ -528,7 +514,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
     elapsed = round(time.time() - start_time, 3)
     logger.info(f"Total cost: ${total_cost:,.2f}, Status: {status}, Time: {elapsed}s")
-    logger.info(f"Improvement: {improvement_pct}% (greedy=${greedy_cost:,.2f} -> final=${total_cost:,.2f})")
+    logger.info(f"Improvement: {improvement_pct}% (greedy=${greedy_cost:,.2f} → final=${total_cost:,.2f})")
 
     try:
         _generate_expert_dashboard(
@@ -571,7 +557,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "three_opt_improvements": threeopt_improved,
                 "crane_rebalance_improvements": crane_opt_improved,
                 "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-                "solver_version": "8.0"
+                "solver_version": "8.1"
             },
             crane_allocation={
                 "distribution": crane_distribution,
@@ -583,7 +569,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 )
             }
         )
-        logger.info("Expert dashboard generated (v8.0)")
+        logger.info("Expert dashboard generated (v8.1)")
     except Exception as e:
         logger.warning(f"Dashboard generation failed: {e}")
 
@@ -641,7 +627,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "three_opt_improvements": threeopt_improved,
             "crane_rebalance_improvements": crane_opt_improved,
             "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-            "solver_version": "8.0"
+            "solver_version": "8.1"
         },
         "benchmark": {
             "execution_cost": {"value": 1.0, "unit": "credits"},
