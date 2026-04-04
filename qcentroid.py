@@ -1,7 +1,9 @@
 """
-Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v7.0
+Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v8.0
 Berth Allocation + Quay Crane Assignment.
-v7.0: Crane-budget-aware greedy, deadline-aware target crane allocation, gentler post-hoc enforcement.
+v8.0: Quantum-inspired berth-spreading with balanced crane allocation.
+Key insight: maximize parallelism across ALL berths with 2-3 cranes/vessel
+instead of packing vessels onto few berths with max cranes.
 """
 import logging
 import time
@@ -19,7 +21,7 @@ logger = logging.getLogger("qcentroid-user-log")
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v7.0 ===")
+    logger.info("=== Classical BAP+QCA Solver v8.0 — Quantum-Inspired Berth-Spreading ===")
 
     vessels = input_data.get("vessels", [])
     berths = input_data.get("berths", [])
@@ -29,8 +31,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     total_cranes = cranes_cfg.get("total_available", 10)
     min_cranes = cranes_cfg.get("min_per_vessel", 1)
     max_cranes = cranes_cfg.get("max_per_vessel", 4)
-    # v7.0: Greedy construction is now crane-budget-aware — tracks timeline
-    # to ensure no time slot exceeds total_cranes
 
     w_wait = cost_weights.get("waiting_cost_per_hour", 500)
     w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
@@ -40,27 +40,22 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_vessels = len(vessels)
     n_berths = len(berths)
     logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
-    max_vessels_per_berth = math.ceil(n_vessels / n_berths) + 1
-    logger.info(f"Berth capacity: {max_vessels_per_berth} vessels/berth")
+
+    # v8.0: Quantum-inspired crane target — spread cranes across berths
+    # With 18 cranes and 6 berths, optimal is ~3 cranes/vessel (matching quantum's 2.4 avg)
+    balanced_cranes = max(min_cranes, min(total_cranes // n_berths, max_cranes))
+    logger.info(f"v8.0: Balanced crane target = {balanced_cranes} per vessel (quantum-inspired)")
 
     # Sort vessels by priority (ascending = higher priority first), then arrival
     sorted_vessels = sorted(vessels, key=lambda v: (v.get("priority", 5), v.get("arrival_time", "")))
 
-    # ── 2. Greedy construction (v7.0) ──────────────────────────────────
+    # ── 2. Greedy construction (v8.0) ──────────────────────────────────
+    # Strategy: spread vessels across ALL berths, use balanced cranes
     assignments = []
     berth_end_times = {}
-    berth_vessel_count = {b["id"]: 0 for b in berths}  # track vessel counts per berth
-    crane_timeline = []  # list of (start_h, end_h, cranes) for active assignments
+    berth_vessel_count = {b["id"]: 0 for b in berths}
+    crane_timeline = []
     cost_evolution = []
-
-    # v7.0: Compute realistic load penalty based on delay cost
-    avg_vessel_cost = 0
-    for v in sorted_vessels:
-        v_teu = v.get("handling_volume_teu", 1000)
-        avg_vessel_cost += v_teu * w_handle / 25
-    avg_vessel_cost = avg_vessel_cost / max(n_vessels, 1)
-    # v7.0: Load penalty to encourage berth spreading
-    load_penalty_factor = 0.50
 
     for v in sorted_vessels:
         v_id = v["id"]
@@ -73,16 +68,20 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         v_name = v.get("name", f"Vessel-{v_id}")
 
         best_berth = None
-        best_cost = float("inf")          # v6.0: now stores PENALIZED cost for comparison
-        best_actual_cost = float("inf")   # v6.0: actual cost (without penalties) for assignment
+        best_cost = float("inf")
         best_start = None
         best_cranes_assigned = min_cranes
         best_handling_hours = 0
         best_wait_hours = 0
         best_delay_hours = 0
-        best_lookahead_score = float("inf")
 
-        for b in berths:
+        # v8.0: Sort berths by current vessel count (least-loaded first) for spreading
+        berths_by_load = sorted(berths, key=lambda b: (
+            berth_vessel_count.get(b["id"], 0),
+            _iso_to_hours(berth_end_times.get(b["id"], v_arrival))
+        ))
+
+        for b in berths_by_load:
             b_id = b["id"]
             b_len = b.get("length_m", 300)
             b_depth = b.get("depth_m", 15.0)
@@ -91,77 +90,61 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             if v_len > b_len or v_draft > b_depth:
                 continue
 
-            # v5.0: Skip berths at capacity unless no other option exists
-            if berth_vessel_count.get(b_id, 0) >= max_vessels_per_berth:
-                continue
-
             berth_free = berth_end_times.get(b_id, v_arrival)
             actual_start = max(v_arrival, berth_free)
             start_h = _iso_to_hours(actual_start)
             deadline_h = _iso_to_hours(v_deadline)
             arr_h = _iso_to_hours(v_arrival)
 
-            # v7.0: Deadline-aware target crane count
-            time_avail = deadline_h - start_h
-            if time_avail > 0:
-                target_cranes = max(min_cranes, min(math.ceil(v_teu / (b_prod * time_avail)) if b_prod > 0 else min_cranes, max_cranes))
-            else:
-                target_cranes = max_cranes  # Deadline passed; use max to minimize delay
-
-            # v7.0: Try cranes in order: target first, then lower (save budget), then higher
-            crane_candidates = []
-            if target_cranes >= min_cranes:
-                crane_candidates.append(target_cranes)
-            # Add lower values (target-1, target-2, ..., min_cranes)
-            for nc in range(target_cranes - 1, min_cranes - 1, -1):
-                if nc not in crane_candidates:
-                    crane_candidates.append(nc)
-            # Add higher values (target+1, target+2, ..., max_cranes)
-            for nc in range(target_cranes + 1, max_cranes + 1):
-                if nc not in crane_candidates:
-                    crane_candidates.append(nc)
+            # v8.0: Try crane counts centered around balanced target
+            # Order: balanced first, then ±1, ±2, etc.
+            crane_candidates = [balanced_cranes]
+            for delta in range(1, max_cranes):
+                if balanced_cranes - delta >= min_cranes:
+                    crane_candidates.append(balanced_cranes - delta)
+                if balanced_cranes + delta <= max_cranes:
+                    crane_candidates.append(balanced_cranes + delta)
 
             for nc in crane_candidates:
-                # v7.0: Check crane budget feasibility BEFORE considering this assignment
                 handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
                 end_h = start_h + handling_hours
-                available_cranes = _get_available_cranes_at_window(start_h, end_h, crane_timeline, total_cranes)
 
+                # v8.0: Check crane budget feasibility
+                available_cranes = _get_available_cranes_at_window(start_h, end_h, crane_timeline, total_cranes)
                 if nc > available_cranes:
-                    continue  # Skip: would exceed crane budget at this time window
+                    continue
 
                 wait_hours = max(0, start_h - arr_h)
                 delay_hours = max(0, end_h - deadline_h)
+                pm = w_priority if v_priority <= 2 else 1.0
                 crane_cost = handling_hours * nc * w_handle
-                wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
-                delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
-
+                wait_cost = wait_hours * w_wait * pm
+                delay_cost = delay_hours * w_delay * pm
                 total_cost = crane_cost + wait_cost + delay_cost
 
-                # v7.0: Load penalty to force spreading across all berths
-                load_penalty = berth_vessel_count.get(b_id, 0) * load_penalty_factor * avg_vessel_cost
-                queue_penalty = 0
-                if berth_vessel_count.get(b_id, 0) > 0:
-                    # Estimate how much queuing at this berth delays future vessels
-                    queue_penalty = handling_hours * w_delay * 0.3
-                penalized_cost = total_cost + load_penalty + queue_penalty
+                # v8.0: STRONG berth-spreading penalty
+                # Penalize proportional to queue length (not just count)
+                vessels_at_berth = berth_vessel_count.get(b_id, 0)
+                # Quadratic penalty: each additional vessel at same berth costs more
+                queue_wait_penalty = 0
+                if vessels_at_berth > 0:
+                    # Estimate: each vessel queued adds ~handling_hours of wait for all future vessels
+                    queue_wait_penalty = vessels_at_berth * handling_hours * w_wait * 0.5
+                # Berth balance penalty: encourage even distribution
+                avg_load = sum(berth_vessel_count.values()) / max(n_berths, 1)
+                imbalance_penalty = max(0, vessels_at_berth - avg_load) * w_delay * 10
 
-                # v7.0: Look-ahead scoring
-                lookahead_score = _compute_lookahead_score(
-                    actual_start, handling_hours, b_id, sorted_vessels, v_id, berth_end_times
-                )
+                penalized_cost = total_cost + queue_wait_penalty + imbalance_penalty
 
-                # v7.0: Compare penalized costs
-                if penalized_cost < best_cost or (penalized_cost == best_cost and lookahead_score < best_lookahead_score):
+                if penalized_cost < best_cost:
                     best_cost = penalized_cost
-                    best_actual_cost = total_cost
                     best_berth = b_id
                     best_start = actual_start
                     best_cranes_assigned = nc
                     best_handling_hours = handling_hours
                     best_wait_hours = wait_hours
                     best_delay_hours = delay_hours
-                    best_lookahead_score = lookahead_score
+                    best_actual_cost = total_cost
 
         if best_berth is not None:
             end_time_str = _hours_to_iso(
@@ -173,8 +156,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
             berth_end_times[best_berth] = end_time_str
             berth_vessel_count[best_berth] += 1
-
-            # v7.0: Record crane usage in timeline for budget tracking
             crane_timeline.append((start_h, end_h, best_cranes_assigned))
 
             assignments.append({
@@ -192,111 +173,76 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "teu_volume": v_teu
             })
         else:
-            # If no berth available with capacity, try without capacity constraint (v7.0)
+            # Fallback: try any berth, any cranes (ignore budget)
+            fallback_best_cost = float("inf")
+            fallback_config = None
             for b in berths:
                 b_id = b["id"]
-                b_len = b.get("length_m", 300)
-                b_depth = b.get("depth_m", 15.0)
-                b_prod = b.get("productivity_teu_per_crane_hour", 25)
-
-                if v_len > b_len or v_draft > b_depth:
+                if v_len > b.get("length_m", 300) or v_draft > b.get("depth_m", 15.0):
                     continue
-
+                b_prod = b.get("productivity_teu_per_crane_hour", 25)
                 berth_free = berth_end_times.get(b_id, v_arrival)
                 actual_start = max(v_arrival, berth_free)
                 start_h = _iso_to_hours(actual_start)
-                deadline_h = _iso_to_hours(v_deadline)
                 arr_h = _iso_to_hours(v_arrival)
+                deadline_h = _iso_to_hours(v_deadline)
 
-                # v7.0: Deadline-aware target cranes
-                time_avail = deadline_h - start_h
-                if time_avail > 0:
-                    target_cranes = max(min_cranes, min(math.ceil(v_teu / (b_prod * time_avail)) if b_prod > 0 else min_cranes, max_cranes))
-                else:
-                    target_cranes = max_cranes
-
-                crane_candidates = []
-                if target_cranes >= min_cranes:
-                    crane_candidates.append(target_cranes)
-                for nc in range(target_cranes - 1, min_cranes - 1, -1):
-                    if nc not in crane_candidates:
-                        crane_candidates.append(nc)
-                for nc in range(target_cranes + 1, max_cranes + 1):
-                    if nc not in crane_candidates:
-                        crane_candidates.append(nc)
-
-                for nc in crane_candidates:
+                for nc in range(min_cranes, max_cranes + 1):
                     handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
                     end_h = start_h + handling_hours
-
-                    # v7.0: Check crane budget even in fallback
-                    available_cranes = _get_available_cranes_at_window(start_h, end_h, crane_timeline, total_cranes)
-                    if nc > available_cranes:
-                        continue
-
                     wait_hours = max(0, start_h - arr_h)
                     delay_hours = max(0, end_h - deadline_h)
-                    crane_cost = handling_hours * nc * w_handle
-                    wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
-                    delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
+                    pm = w_priority if v_priority <= 2 else 1.0
+                    cost = (handling_hours * nc * w_handle +
+                            wait_hours * w_wait * pm +
+                            delay_hours * w_delay * pm)
+                    if cost < fallback_best_cost:
+                        fallback_best_cost = cost
+                        fallback_config = {
+                            "berth_id": b_id, "start": actual_start,
+                            "cranes": nc, "handling_hours": handling_hours,
+                            "wait_hours": wait_hours, "delay_hours": delay_hours,
+                            "cost": cost
+                        }
 
-                    total_cost = crane_cost + wait_cost + delay_cost
-
-                    if total_cost < best_cost:
-                        best_cost = total_cost
-                        best_actual_cost = total_cost
-                        best_berth = b_id
-                        best_start = actual_start
-                        best_cranes_assigned = nc
-                        best_handling_hours = handling_hours
-                        best_wait_hours = wait_hours
-                        best_delay_hours = delay_hours
-
-            if best_berth is not None:
+            if fallback_config:
+                fc = fallback_config
                 end_time_str = _hours_to_iso(
-                    _iso_to_hours(best_start) + best_handling_hours,
-                    best_start
+                    _iso_to_hours(fc["start"]) + fc["handling_hours"], fc["start"]
                 )
-                start_h = _iso_to_hours(best_start)
-                end_h = start_h + best_handling_hours
-
-                berth_end_times[best_berth] = end_time_str
-                berth_vessel_count[best_berth] += 1
-
-                # v7.0: Record crane usage in timeline
-                crane_timeline.append((start_h, end_h, best_cranes_assigned))
-
+                berth_end_times[fc["berth_id"]] = end_time_str
+                berth_vessel_count[fc["berth_id"]] += 1
+                crane_timeline.append((_iso_to_hours(fc["start"]),
+                                       _iso_to_hours(fc["start"]) + fc["handling_hours"],
+                                       fc["cranes"]))
                 assignments.append({
-                    "vessel_id": v_id,
-                    "vessel_name": v_name,
-                    "berth_id": best_berth,
-                    "start_time": best_start,
-                    "end_time": end_time_str,
-                    "cranes_assigned": best_cranes_assigned,
-                    "handling_hours": round(best_handling_hours, 2),
-                    "waiting_hours": round(best_wait_hours, 2),
-                    "delay_hours": round(best_delay_hours, 2),
-                    "cost": round(best_cost, 2),
-                    "priority": v_priority,
-                    "teu_volume": v_teu
+                    "vessel_id": v_id, "vessel_name": v_name,
+                    "berth_id": fc["berth_id"], "start_time": fc["start"],
+                    "end_time": end_time_str, "cranes_assigned": fc["cranes"],
+                    "handling_hours": round(fc["handling_hours"], 2),
+                    "waiting_hours": round(fc["wait_hours"], 2),
+                    "delay_hours": round(fc["delay_hours"], 2),
+                    "cost": round(fc["cost"], 2),
+                    "priority": v_priority, "teu_volume": v_teu
                 })
             else:
                 assignments.append({
-                    "vessel_id": v_id,
-                    "vessel_name": v_name,
-                    "berth_id": None,
-                    "start_time": None,
-                    "end_time": None,
-                    "cranes_assigned": 0,
-                    "handling_hours": 0,
-                    "cost": 0,
+                    "vessel_id": v_id, "vessel_name": v_name,
+                    "berth_id": None, "start_time": None, "end_time": None,
+                    "cranes_assigned": 0, "handling_hours": 0, "cost": 0,
                     "status": "infeasible"
                 })
                 logger.warning(f"Vessel {v_id}: no feasible berth found!")
 
     greedy_cost = sum(a["cost"] for a in assignments)
     cost_evolution.append({"iteration": 0, "phase": "greedy", "objective_value": round(greedy_cost, 2)})
-    logger.info(f"Greedy phase complete: cost={greedy_cost:.2f} (crane-budget-feasible by construction)")
+    logger.info(f"Greedy phase: cost=${greedy_cost:,.2f}")
+
+    # Log berth distribution after greedy
+    for b in berths:
+        cnt = berth_vessel_count.get(b["id"], 0)
+        if cnt > 0:
+            logger.info(f"  {b['id']}: {cnt} vessels")
 
     # ── 3. 2-opt local search improvement ─────────────────────────────
     max_iterations = solver_params.get("max_2opt_iterations", 50)
@@ -327,10 +273,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         })
 
     two_opt_cost = sum(a["cost"] for a in assignments)
-    logger.info(f"2-opt completed after {iteration} iterations: cost={two_opt_cost:.2f}")
+    logger.info(f"2-opt completed after {iteration} iterations: cost=${two_opt_cost:,.2f}")
 
     # ── 3b. Or-opt moves: relocate single vessels ─────────────────────
     oropt_improved = 0
+    max_vessels_per_berth = math.ceil(n_vessels / n_berths) + 1
     for idx, a in enumerate(assignments):
         if a.get("berth_id") is None:
             continue
@@ -339,42 +286,30 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             continue
 
         old_cost = a["cost"]
-        best_cost = old_cost
+        best_cost_oropt = old_cost
         best_config = None
 
-        # Try moving this vessel to each alternative berth
         for b in berths:
             b_id = b["id"]
             if b_id == a.get("berth_id"):
-                continue  # Skip current berth
+                continue
 
             v_len = v_data.get("length_m", 200)
             v_draft = v_data.get("draft_m", 12.0)
-            b_len = b.get("length_m", 300)
-            b_depth = b.get("depth_m", 15.0)
-
-            if v_len > b_len or v_draft > b_depth:
+            if v_len > b.get("length_m", 300) or v_draft > b.get("depth_m", 15.0):
                 continue
 
-            # v5.0: Check berth capacity for or-opt moves
-            vessel_count_at_berth = sum(1 for x in assignments if x.get("berth_id") == b_id and x.get("berth_id") is not None)
+            vessel_count_at_berth = sum(1 for x in assignments if x.get("berth_id") == b_id)
             if vessel_count_at_berth >= max_vessels_per_berth:
                 continue
 
             for nc in range(min_cranes, max_cranes + 1):
                 config = _evaluate_vessel_at_berth(v_data, b, a["start_time"], nc, cost_weights)
-                if config is not None:
-                    # v6.0: Add load penalty to or-opt to prevent undoing greedy spreading
-                    oropt_load_penalty = vessel_count_at_berth * load_penalty_factor * avg_vessel_cost
-                    oropt_penalized = config["cost"] + oropt_load_penalty
-                    if oropt_penalized < best_cost:
-                        best_cost = oropt_penalized
-                        best_config = {"berth": b_id, "config": config, "cranes": nc}
+                if config is not None and config["cost"] < best_cost_oropt:
+                    best_cost_oropt = config["cost"]
+                    best_config = {"berth": b_id, "config": config, "cranes": nc}
 
-        # v6.0: Also apply penalty to current berth for fair comparison
-        current_berth_count = sum(1 for x in assignments if x.get("berth_id") == a.get("berth_id") and x.get("berth_id") is not None) - 1
-        old_penalized_cost = old_cost + current_berth_count * load_penalty_factor * avg_vessel_cost
-        if best_config is not None and best_cost < old_penalized_cost * 0.99:
+        if best_config is not None and best_cost_oropt < old_cost * 0.99:
             assignments[idx]["berth_id"] = best_config["berth"]
             assignments[idx]["cost"] = best_config["config"]["cost"]
             assignments[idx]["handling_hours"] = best_config["config"]["handling_hours"]
@@ -391,14 +326,13 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "phase": "or-opt",
             "objective_value": round(current_cost, 2)
         })
-        logger.info(f"Or-opt moved {oropt_improved} vessels: cost={current_cost:.2f}")
+        logger.info(f"Or-opt moved {oropt_improved} vessels: cost=${current_cost:,.2f}")
 
-    # ── 3c. 3-opt moves: rotate 3 vessels among 3 berths (v5.0 new) ────
+    # ── 3c. 3-opt moves: rotate 3 vessels among 3 berths ────
     threeopt_improved = 0
     max_3opt_iterations = 30
     for iteration_3opt in range(max_3opt_iterations):
         improved_3opt = False
-        # Iterate through all triples of feasible assignments
         feasible_indices = [i for i, a in enumerate(assignments) if a.get("berth_id") is not None]
         if len(feasible_indices) < 3:
             break
@@ -407,7 +341,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             a1, a2, a3 = assignments[i], assignments[j], assignments[k]
             old_cost = a1["cost"] + a2["cost"] + a3["cost"]
 
-            # Try rotating berth assignments: a1→b2, a2→b3, a3→b1
             b1_id, b2_id, b3_id = a1["berth_id"], a2["berth_id"], a3["berth_id"]
             if b1_id == b2_id or b2_id == b3_id or b1_id == b3_id:
                 continue
@@ -422,7 +355,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             if not all([v1, v2, v3, b1, b2, b3]):
                 continue
 
-            # Check feasibility of rotation
             if v1.get("length_m", 200) > b2.get("length_m", 300) or v1.get("draft_m", 12) > b2.get("depth_m", 15):
                 continue
             if v2.get("length_m", 200) > b3.get("length_m", 300) or v2.get("draft_m", 12) > b3.get("depth_m", 15):
@@ -430,7 +362,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             if v3.get("length_m", 200) > b1.get("length_m", 300) or v3.get("draft_m", 12) > b1.get("depth_m", 15):
                 continue
 
-            # Evaluate rotated configuration
             config1 = _evaluate_vessel_at_berth(v1, b2, a1["start_time"], a1["cranes_assigned"], cost_weights)
             config2 = _evaluate_vessel_at_berth(v2, b3, a2["start_time"], a2["cranes_assigned"], cost_weights)
             config3 = _evaluate_vessel_at_berth(v3, b1, a3["start_time"], a3["cranes_assigned"], cost_weights)
@@ -438,7 +369,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             if config1 and config2 and config3:
                 new_cost = config1["cost"] + config2["cost"] + config3["cost"]
                 if new_cost < old_cost * 0.99:
-                    # Apply rotation
                     assignments[i]["berth_id"] = b2_id
                     assignments[i].update(config1)
                     assignments[j]["berth_id"] = b3_id
@@ -458,9 +388,9 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "phase": "3-opt",
             "objective_value": round(current_cost, 2)
         })
-        logger.info(f"3-opt improved {threeopt_improved} configurations: cost={current_cost:.2f}")
+        logger.info(f"3-opt improved {threeopt_improved} configs: cost=${current_cost:,.2f}")
 
-    # ── 3d. Crane re-balancing pass ──────────────────────────────────
+    # ── 3d. Crane re-optimization pass ──────────────────────────────────
     crane_opt_improved = 0
     for idx, a in enumerate(assignments):
         if a.get("berth_id") is None:
@@ -476,7 +406,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
 
         best_nc = a["cranes_assigned"]
-        best_cost = a["cost"]
+        best_cost_crane = a["cost"]
 
         for nc in range(min_cranes, max_cranes + 1):
             handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
@@ -490,22 +420,21 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                     wait_h * w_wait * pm +
                     delay_h * w_delay * pm)
 
-            if cost < best_cost:
-                best_cost = cost
+            if cost < best_cost_crane:
+                best_cost_crane = cost
                 best_nc = nc
 
         if best_nc != a["cranes_assigned"]:
             handling_h = v_teu / (b_prod * best_nc) if b_prod * best_nc > 0 else 999
             end_h = _iso_to_hours(a["start_time"]) + handling_h
-            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
-            delay_h = max(0, end_h - deadline_h)
+            delay_h = max(0, end_h - _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z")))
             wait_h = a.get("waiting_hours", 0)
 
             assignments[idx] = dict(a)
             assignments[idx]["cranes_assigned"] = best_nc
             assignments[idx]["handling_hours"] = round(handling_h, 2)
             assignments[idx]["delay_hours"] = round(delay_h, 2)
-            assignments[idx]["cost"] = round(best_cost, 2)
+            assignments[idx]["cost"] = round(best_cost_crane, 2)
             assignments[idx]["end_time"] = _hours_to_iso(end_h, a["start_time"])
             crane_opt_improved += 1
 
@@ -516,17 +445,16 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "phase": "crane_reopt",
             "objective_value": round(final_cost_after_crane_opt, 2)
         })
-        logger.info(f"Crane re-balancing improved {crane_opt_improved} assignments: "
-                     f"cost={final_cost_after_crane_opt:.2f}")
+        logger.info(f"Crane reopt: {crane_opt_improved} adjusted, cost=${final_cost_after_crane_opt:,.2f}")
 
-    # ── 3e. GENTLE FINAL CRANE BUDGET + RESEQUENCING (v7.0) ─────────
-    # Single safety-net pass: since greedy is crane-budget-aware, this should be minimal
-    logger.info("Final gentle crane budget safety-net pass...")
+    # ── 3e. GENTLE FINAL CRANE BUDGET + RESEQUENCING (v8.0) ─────────
+    # v8.0: With balanced crane allocation, enforcement should be minimal
+    logger.info("Final crane budget safety-net pass...")
     assignments, final_crane_changes = _enforce_crane_budget(
         assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights
     )
     if final_crane_changes > 0:
-        logger.info(f"Final crane budget: {final_crane_changes} minor adjustments")
+        logger.info(f"Final crane budget: {final_crane_changes} adjustments")
     assignments, final_reseq_changes = _resequence_all_berths(
         assignments, vessels, berths, cost_weights, w_priority
     )
@@ -538,7 +466,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "phase": "final_safety_net",
         "objective_value": round(post_reseq_cost, 2)
     })
-    logger.info(f"Final cost after safety-net: {post_reseq_cost:.2f}")
+    logger.info(f"Final cost after safety-net: ${post_reseq_cost:,.2f}")
 
     # Compute final metrics
     total_cost = sum(a["cost"] for a in assignments)
@@ -596,19 +524,15 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         pa["avg_wait_h"] = round(pa["total_wait_h"] / max(pa["count"], 1), 2)
         pa["avg_delay_h"] = round(pa["total_delay_h"] / max(pa["count"], 1), 2)
 
-    # v7.0: Improvement now measures local-search gains over greedy (greedy is feasible)
     improvement_pct = round((1 - total_cost / max(greedy_cost, 1)) * 100, 2) if greedy_cost > 0 else 0
 
     elapsed = round(time.time() - start_time, 3)
-    logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
-    logger.info(f"Improvement: {improvement_pct}% (greedy={greedy_cost:.2f}, 2-opt={two_opt_cost:.2f}, "
-                f"final={total_cost:.2f})")
+    logger.info(f"Total cost: ${total_cost:,.2f}, Status: {status}, Time: {elapsed}s")
+    logger.info(f"Improvement: {improvement_pct}% (greedy=${greedy_cost:,.2f} -> final=${total_cost:,.2f})")
 
     try:
         _generate_expert_dashboard(
-            assignments=assignments,
-            berths=berths,
-            vessels=vessels,
+            assignments=assignments, berths=berths, vessels=vessels,
             cost_breakdown={
                 "total_cost": round(total_cost, 2),
                 "crane_handling_cost": round(total_crane_cost, 2),
@@ -647,7 +571,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "three_opt_improvements": threeopt_improved,
                 "crane_rebalance_improvements": crane_opt_improved,
                 "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-                "solver_version": "7.0"
+                "solver_version": "8.0"
             },
             crane_allocation={
                 "distribution": crane_distribution,
@@ -659,9 +583,9 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 )
             }
         )
-        logger.info("Expert dashboard generated successfully (v7.0)")
+        logger.info("Expert dashboard generated (v8.0)")
     except Exception as e:
-        logger.warning(f"Failed to generate expert dashboard: {e}")
+        logger.warning(f"Dashboard generation failed: {e}")
 
     return {
         "assignments": assignments,
@@ -717,7 +641,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "three_opt_improvements": threeopt_improved,
             "crane_rebalance_improvements": crane_opt_improved,
             "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-            "solver_version": "7.0"
+            "solver_version": "8.0"
         },
         "benchmark": {
             "execution_cost": {"value": 1.0, "unit": "credits"},
@@ -725,7 +649,3 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "energy_consumption": 0.0
         }
     }
-
-
-# ── v6.0 Helper functions ───────────────────────────────────────────
-
