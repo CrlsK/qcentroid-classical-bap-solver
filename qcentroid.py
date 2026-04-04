@@ -1932,7 +1932,7 @@ def _generate_expert_dashboard(assignments, berths, vessels, cost_breakdown,
     with open("additional_output/01_expert_dashboard.html", "w") as f:
         f.write(html)
 
- Claude is active in this tab group  
+
+Claude is active in this tab group
 Open chat
- 
 Dismiss
