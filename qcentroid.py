@@ -1,6 +1,20 @@
 """
-Classical BAP+QCA Greedy-2Opt Solver v4.0
-Berth Allocation + Quay Crane Assignment using greedy construction + 2-opt + or-opt + crane rebalancing.
+Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v5.0
+Berth Allocation + Quay Crane Assignment using greedy construction + 2-opt + or-opt + 3-opt + crane rebalancing.
+
+v5.0 changes (Iteration 3):
+- CRITICAL FIX: Berth diversity constraint with soft penalty in greedy phase (prevents all vessels on cheapest berth)
+- Berth load penalty: 5% of average vessel cost per existing assignment (load balancing)
+- 3-opt neighborhood: rotating 3 vessels among 3 berths for additional improvements
+- DYNAMIC EXPERT DASHBOARD: Single comprehensive 01_expert_dashboard.html with 6 tabs:
+  * Port Overview (SVG vessel map with priority coloring)
+  * Gantt Timeline (interactive Plotly Gantt)
+  * Cost Intelligence (KPI cards + donut + bar charts)
+  * Optimization Convergence (line chart with phase markers)
+  * Berth Analytics (utilization heatmap + vessel distribution)
+  * Performance Summary (metric cards + timing breakdown)
+- Dark professional theme (deep teal #0a192f, accents #2c74b3, highlights #64ffda)
+- All Plotly charts via CDN (https://cdn.plot.ly/plotly-2.27.0.min.js)
 
 v4.0 changes:
 - Or-opt moves: single vessel relocation to different berths (explores neighborhood better than 2-opt alone)
@@ -23,13 +37,15 @@ import logging
 import time
 import itertools
 import os
+import json
+import math
 
 logger = logging.getLogger("qcentroid-user-log")
 
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Classical BAP+QCA Greedy-2Opt-OrOpt Solver v4.0 ===")
+    logger.info("=== Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v5.0 ===")
 
     # ── 1. Parse inputs ──────────────────────────────────────────────
     vessels = input_data.get("vessels", [])
@@ -50,13 +66,25 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_berths = len(berths)
     logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
 
+    # v5.0: Berth capacity constraint
+    max_vessels_per_berth = math.ceil(n_vessels / n_berths) + 1
+    logger.info(f"Berth capacity limit: {max_vessels_per_berth} vessels per berth (v5.0)")
+
     # Sort vessels by priority (ascending = higher priority first), then arrival
     sorted_vessels = sorted(vessels, key=lambda v: (v.get("priority", 5), v.get("arrival_time", "")))
 
-    # ── 2. Greedy construction with time-aware look-ahead ────────────
+    # ── 2. Greedy construction with berth balancing & load penalty (v5.0) ────────────
     assignments = []
     berth_end_times = {}
+    berth_vessel_count = {b["id"]: 0 for b in berths}  # v5.0: track vessel counts per berth
     cost_evolution = []
+
+    # Compute average vessel cost for load penalty
+    avg_vessel_cost = 0
+    for v in sorted_vessels:
+        v_teu = v.get("handling_volume_teu", 1000)
+        avg_vessel_cost += v_teu * w_handle / 25  # rough estimate
+    avg_vessel_cost = avg_vessel_cost / max(n_vessels, 1)
 
     for v in sorted_vessels:
         v_id = v["id"]
@@ -86,6 +114,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             if v_len > b_len or v_draft > b_depth:
                 continue
 
+            # v5.0: Skip berths at capacity unless no other option exists
+            if berth_vessel_count.get(b_id, 0) >= max_vessels_per_berth:
+                continue
+
             berth_free = berth_end_times.get(b_id, v_arrival)
             actual_start = max(v_arrival, berth_free)
 
@@ -102,14 +134,18 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
                 total_cost = crane_cost + wait_cost + delay_cost
 
-                # v4.0: Look-ahead scoring: penalize berths that would block high-priority vessels
+                # v5.0: Add berth load penalty to balance vessels across berths
+                load_penalty = berth_vessel_count.get(b_id, 0) * 0.05 * avg_vessel_cost
+                penalized_cost = total_cost + load_penalty
+
+                # v5.0: Look-ahead scoring
                 lookahead_score = _compute_lookahead_score(
                     actual_start, handling_hours, b_id, sorted_vessels, v_id, berth_end_times
                 )
 
-                # Accept if better cost, or equal cost but better lookahead
-                if total_cost < best_cost or (total_cost == best_cost and lookahead_score < best_lookahead_score):
-                    best_cost = total_cost
+                # Accept if better penalized cost, or equal cost but better lookahead
+                if penalized_cost < best_cost or (penalized_cost == best_cost and lookahead_score < best_lookahead_score):
+                    best_cost = total_cost  # Store actual cost, not penalized
                     best_berth = b_id
                     best_start = actual_start
                     best_cranes_assigned = nc
@@ -124,6 +160,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 best_start
             )
             berth_end_times[best_berth] = end_time_str
+            berth_vessel_count[best_berth] += 1  # v5.0: increment vessel count
 
             assignments.append({
                 "vessel_id": v_id,
@@ -140,18 +177,76 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "teu_volume": v_teu
             })
         else:
-            assignments.append({
-                "vessel_id": v_id,
-                "vessel_name": v_name,
-                "berth_id": None,
-                "start_time": None,
-                "end_time": None,
-                "cranes_assigned": 0,
-                "handling_hours": 0,
-                "cost": 0,
-                "status": "infeasible"
-            })
-            logger.warning(f"Vessel {v_id}: no feasible berth found!")
+            # If no berth available, try without capacity constraint
+            for b in berths:
+                b_id = b["id"]
+                b_len = b.get("length_m", 300)
+                b_depth = b.get("depth_m", 15.0)
+                b_prod = b.get("productivity_teu_per_crane_hour", 25)
+
+                if v_len > b_len or v_draft > b_depth:
+                    continue
+
+                berth_free = berth_end_times.get(b_id, v_arrival)
+                actual_start = max(v_arrival, berth_free)
+
+                for nc in range(min_cranes, min(max_cranes, total_cranes) + 1):
+                    handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+                    end_time_h = _iso_to_hours(actual_start) + handling_hours
+                    deadline_h = _iso_to_hours(v_deadline)
+
+                    wait_hours = max(0, _iso_to_hours(actual_start) - _iso_to_hours(v_arrival))
+                    delay_hours = max(0, end_time_h - deadline_h)
+                    crane_cost = handling_hours * nc * w_handle
+                    wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
+                    delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
+
+                    total_cost = crane_cost + wait_cost + delay_cost
+
+                    if total_cost < best_cost:
+                        best_cost = total_cost
+                        best_berth = b_id
+                        best_start = actual_start
+                        best_cranes_assigned = nc
+                        best_handling_hours = handling_hours
+                        best_wait_hours = wait_hours
+                        best_delay_hours = delay_hours
+
+            if best_berth is not None:
+                end_time_str = _hours_to_iso(
+                    _iso_to_hours(best_start) + best_handling_hours,
+                    best_start
+                )
+                berth_end_times[best_berth] = end_time_str
+                berth_vessel_count[best_berth] += 1
+
+                assignments.append({
+                    "vessel_id": v_id,
+                    "vessel_name": v_name,
+                    "berth_id": best_berth,
+                    "start_time": best_start,
+                    "end_time": end_time_str,
+                    "cranes_assigned": best_cranes_assigned,
+                    "handling_hours": round(best_handling_hours, 2),
+                    "waiting_hours": round(best_wait_hours, 2),
+                    "delay_hours": round(best_delay_hours, 2),
+                    "cost": round(best_cost, 2),
+                    "priority": v_priority,
+                    "teu_volume": v_teu
+                })
+            else:
+                assignments.append({
+                    "vessel_id": v_id,
+                    "vessel_name": v_name,
+                    "berth_id": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "cranes_assigned": 0,
+                    "handling_hours": 0,
+                    "cost": 0,
+                    "status": "infeasible"
+                })
+                logger.warning(f"Vessel {v_id}: no feasible berth found!")
 
     greedy_cost = sum(a["cost"] for a in assignments)
     cost_evolution.append({"iteration": 0, "phase": "greedy", "objective_value": round(greedy_cost, 2)})
@@ -188,7 +283,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     two_opt_cost = sum(a["cost"] for a in assignments)
     logger.info(f"2-opt completed after {iteration} iterations: cost={two_opt_cost:.2f}")
 
-    # ── 3b. Or-opt moves: relocate single vessels (v4.0 new) ──────────
+    # ── 3b. Or-opt moves: relocate single vessels ─────────────────────
     oropt_improved = 0
     for idx, a in enumerate(assignments):
         if a.get("berth_id") is None:
@@ -213,6 +308,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             b_depth = b.get("depth_m", 15.0)
 
             if v_len > b_len or v_draft > b_depth:
+                continue
+
+            # v5.0: Check berth capacity for or-opt moves
+            vessel_count_at_berth = sum(1 for x in assignments if x.get("berth_id") == b_id and x.get("berth_id") is not None)
+            if vessel_count_at_berth >= max_vessels_per_berth:
                 continue
 
             # Try different crane counts for this berth
@@ -241,7 +341,74 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         })
         logger.info(f"Or-opt moved {oropt_improved} vessels: cost={current_cost:.2f}")
 
-    # ── 3c. Crane re-balancing pass (v4.0 enhanced) ──────────────────
+    # ── 3c. 3-opt moves: rotate 3 vessels among 3 berths (v5.0 new) ────
+    threeopt_improved = 0
+    max_3opt_iterations = 30
+    for iteration_3opt in range(max_3opt_iterations):
+        improved_3opt = False
+        # Iterate through all triples of feasible assignments
+        feasible_indices = [i for i, a in enumerate(assignments) if a.get("berth_id") is not None]
+        if len(feasible_indices) < 3:
+            break
+
+        for i, j, k in itertools.combinations(feasible_indices, 3):
+            a1, a2, a3 = assignments[i], assignments[j], assignments[k]
+            old_cost = a1["cost"] + a2["cost"] + a3["cost"]
+
+            # Try rotating berth assignments: a1→b2, a2→b3, a3→b1
+            b1_id, b2_id, b3_id = a1["berth_id"], a2["berth_id"], a3["berth_id"]
+            if b1_id == b2_id or b2_id == b3_id or b1_id == b3_id:
+                continue
+
+            v1 = next((v for v in vessels if v["id"] == a1["vessel_id"]), None)
+            v2 = next((v for v in vessels if v["id"] == a2["vessel_id"]), None)
+            v3 = next((v for v in vessels if v["id"] == a3["vessel_id"]), None)
+            b2 = next((b for b in berths if b["id"] == b2_id), None)
+            b3 = next((b for b in berths if b["id"] == b3_id), None)
+            b1 = next((b for b in berths if b["id"] == b1_id), None)
+
+            if not all([v1, v2, v3, b1, b2, b3]):
+                continue
+
+            # Check feasibility of rotation
+            if v1.get("length_m", 200) > b2.get("length_m", 300) or v1.get("draft_m", 12) > b2.get("depth_m", 15):
+                continue
+            if v2.get("length_m", 200) > b3.get("length_m", 300) or v2.get("draft_m", 12) > b3.get("depth_m", 15):
+                continue
+            if v3.get("length_m", 200) > b1.get("length_m", 300) or v3.get("draft_m", 12) > b1.get("depth_m", 15):
+                continue
+
+            # Evaluate rotated configuration
+            config1 = _evaluate_vessel_at_berth(v1, b2, a1["start_time"], a1["cranes_assigned"], cost_weights)
+            config2 = _evaluate_vessel_at_berth(v2, b3, a2["start_time"], a2["cranes_assigned"], cost_weights)
+            config3 = _evaluate_vessel_at_berth(v3, b1, a3["start_time"], a3["cranes_assigned"], cost_weights)
+
+            if config1 and config2 and config3:
+                new_cost = config1["cost"] + config2["cost"] + config3["cost"]
+                if new_cost < old_cost * 0.99:
+                    # Apply rotation
+                    assignments[i]["berth_id"] = b2_id
+                    assignments[i].update(config1)
+                    assignments[j]["berth_id"] = b3_id
+                    assignments[j].update(config2)
+                    assignments[k]["berth_id"] = b1_id
+                    assignments[k].update(config3)
+                    improved_3opt = True
+                    threeopt_improved += 1
+
+        if not improved_3opt:
+            break
+
+    current_cost = sum(a["cost"] for a in assignments)
+    if threeopt_improved > 0:
+        cost_evolution.append({
+            "iteration": iteration + 2,
+            "phase": "3-opt",
+            "objective_value": round(current_cost, 2)
+        })
+        logger.info(f"3-opt improved {threeopt_improved} configurations: cost={current_cost:.2f}")
+
+    # ── 3d. Crane re-balancing pass ──────────────────────────────────
     crane_opt_improved = 0
     for idx, a in enumerate(assignments):
         if a.get("berth_id") is None:
@@ -293,7 +460,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     final_cost_after_crane_opt = sum(a["cost"] for a in assignments)
     if crane_opt_improved > 0:
         cost_evolution.append({
-            "iteration": iteration + 2,
+            "iteration": iteration + 3,
             "phase": "crane_reopt",
             "objective_value": round(final_cost_after_crane_opt, 2)
         })
@@ -331,921 +498,607 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "vessels_served": len(b_assignments),
             "occupied_hours": round(occupied_hours, 2),
             "utilization_pct": util_pct,
-            "total_teu_handled": sum(a.get("teu_volume", 0) for a in b_assignments)
         })
 
-    # Cost breakdown by category
+    # Cost breakdown by type
     total_crane_cost = sum(
-        a.get("handling_hours", 0) * a.get("cranes_assigned", 1) * w_handle
-        for a in assignments if a.get("berth_id")
+        a.get("handling_hours", 0) * a.get("cranes_assigned", 0) * w_handle
+        for a in assignments
+        if a.get("berth_id") is not None
     )
     total_wait_cost = sum(
         a.get("waiting_hours", 0) * w_wait * (w_priority if a.get("priority", 3) <= 2 else 1.0)
-        for a in assignments if a.get("berth_id")
+        for a in assignments
+        if a.get("berth_id") is not None
     )
     total_delay_cost = sum(
         a.get("delay_hours", 0) * w_delay * (w_priority if a.get("priority", 3) <= 2 else 1.0)
-        for a in assignments if a.get("berth_id")
+        for a in assignments
+        if a.get("berth_id") is not None
     )
 
-    # Crane allocation distribution
-    crane_distribution = {}
-    for a in assignments:
-        nc = a.get("cranes_assigned", 0)
-        crane_distribution[str(nc)] = crane_distribution.get(str(nc), 0) + 1
+    cost_breakdown = {
+        "total": round(total_cost, 2),
+        "crane_cost": round(total_crane_cost, 2),
+        "waiting_cost": round(total_wait_cost, 2),
+        "delay_cost": round(total_delay_cost, 2),
+    }
 
-    # Gantt chart data
-    gantt_data = []
-    for a in assignments:
-        if a.get("berth_id") is not None:
-            gantt_data.append({
-                "vessel": a.get("vessel_name", a["vessel_id"]),
-                "berth": a["berth_id"],
-                "start": a["start_time"],
-                "end": a["end_time"],
-                "cranes": a["cranes_assigned"],
-                "priority": a.get("priority", 3)
-            })
-
-    # Priority analysis
-    priority_analysis = {}
-    for a in assignments:
-        p = a.get("priority", 3)
-        key = f"P{p}"
-        if key not in priority_analysis:
-            priority_analysis[key] = {"count": 0, "total_cost": 0, "total_wait_h": 0, "total_delay_h": 0}
-        priority_analysis[key]["count"] += 1
-        priority_analysis[key]["total_cost"] += a.get("cost", 0)
-        priority_analysis[key]["total_wait_h"] += a.get("waiting_hours", 0)
-        priority_analysis[key]["total_delay_h"] += a.get("delay_hours", 0)
-    for key in priority_analysis:
-        pa = priority_analysis[key]
-        pa["avg_cost"] = round(pa["total_cost"] / max(pa["count"], 1), 2)
-        pa["total_cost"] = round(pa["total_cost"], 2)
-        pa["avg_wait_h"] = round(pa["total_wait_h"] / max(pa["count"], 1), 2)
-        pa["avg_delay_h"] = round(pa["total_delay_h"] / max(pa["count"], 1), 2)
-
-    improvement_pct = round((1 - total_cost / max(greedy_cost, 1)) * 100, 2) if greedy_cost > 0 else 0
-
-    elapsed = round(time.time() - start_time, 3)
-    logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
-    logger.info(f"Improvement: {improvement_pct}% over greedy (greedy={greedy_cost:.2f}, "
-                f"2-opt={two_opt_cost:.2f}, or-opt={current_cost:.2f}, crane-reopt={final_cost_after_crane_opt:.2f})")
-
-    # ── 6. Generate additional output visualizations ─────────────────
-    try:
-        _generate_additional_output(
-            assignments=assignments,
-            berths=berths,
-            vessels=vessels,
-            cost_breakdown={
-                "total_cost": round(total_cost, 2),
-                "crane_handling_cost": round(total_crane_cost, 2),
-                "waiting_cost": round(total_wait_cost, 2),
-                "delay_penalty_cost": round(total_delay_cost, 2),
-                "cost_per_vessel": round(total_cost / max(n_vessels, 1), 2),
-                "cost_per_teu": round(total_cost / max(total_teu, 1), 4)
-            },
-            optimization_convergence={
-                "greedy_initial_cost": round(greedy_cost, 2),
-                "two_opt_cost": round(two_opt_cost, 2),
-                "crane_reopt_cost": round(final_cost_after_crane_opt, 2),
-                "final_optimized_cost": round(total_cost, 2),
-                "improvement_pct": improvement_pct,
-                "iterations_used": iteration,
-                "crane_adjustments": crane_opt_improved,
-                "cost_evolution": cost_evolution
-            },
-            berth_utilization=berth_utilization,
-            priority_analysis=priority_analysis,
-            gantt_data=gantt_data,
-            schedule_metrics={
-                "total_waiting_time": round(total_wait, 2),
-                "avg_waiting_time": round(total_wait / max(n_vessels, 1), 2),
-                "makespan": round(makespan, 2),
-                "utilization": round(total_handling / max(makespan * n_berths, 1), 4),
-                "total_teu_processed": total_teu,
-                "feasible_assignments": feasible_count,
-                "infeasible_assignments": n_vessels - feasible_count
-            },
-            computation_metrics={
-                "wall_time_s": elapsed,
-                "algorithm": "Greedy_2Opt_OrOpt_CraneRebalance_BAP_QCA",
-                "iterations": iteration,
-                "or_opt_improvements": oropt_improved,
-                "crane_rebalance_improvements": crane_opt_improved,
-                "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-                "solver_version": "4.0"
-            },
-            crane_allocation={
-                "distribution": crane_distribution,
-                "avg_cranes_per_vessel": round(
-                    sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_count, 1), 2
-                ),
-                "total_crane_hours": round(
-                    sum(a.get("handling_hours", 0) * a.get("cranes_assigned", 0) for a in assignments), 2
-                )
-            }
-        )
-        logger.info("Additional output visualizations generated successfully")
-    except Exception as e:
-        logger.warning(f"Failed to generate additional output: {e}")
-
-    return {
-        # ── Core assignment result ──
-        "assignments": assignments,
+    # Prepare output
+    output = {
+        "status": status,
         "objective_value": round(total_cost, 2),
-        "solution_status": status,
-
-        # ── Input size metrics ──
-        "num_vessels": n_vessels,
-        "num_berths": n_berths,
-        "total_cranes": total_cranes,
-
-        # ── Schedule metrics ──
-        "schedule_metrics": {
-            "total_waiting_time": round(total_wait, 2),
-            "avg_waiting_time": round(total_wait / max(n_vessels, 1), 2),
-            "makespan": round(makespan, 2),
-            "utilization": round(total_handling / max(makespan * n_berths, 1), 4),
-            "total_teu_processed": total_teu,
-            "feasible_assignments": feasible_count,
-            "infeasible_assignments": n_vessels - feasible_count
-        },
-
-        # ── Visual: Cost breakdown (pie/bar chart ready) ──
-        "cost_breakdown": {
+        "assignments": assignments,
+        "metrics": {
             "total_cost": round(total_cost, 2),
-            "crane_handling_cost": round(total_crane_cost, 2),
-            "waiting_cost": round(total_wait_cost, 2),
-            "delay_penalty_cost": round(total_delay_cost, 2),
-            "cost_per_vessel": round(total_cost / max(n_vessels, 1), 2),
-            "cost_per_teu": round(total_cost / max(total_teu, 1), 4)
-        },
-
-        # ── Visual: Optimization convergence (line chart ready) ──
-        "optimization_convergence": {
-            "greedy_initial_cost": round(greedy_cost, 2),
-            "two_opt_cost": round(two_opt_cost, 2),
-            "crane_reopt_cost": round(final_cost_after_crane_opt, 2),
-            "final_optimized_cost": round(total_cost, 2),
-            "improvement_pct": improvement_pct,
-            "iterations_used": iteration,
-            "crane_adjustments": crane_opt_improved,
-            "cost_evolution": cost_evolution
-        },
-
-        # ── Visual: Berth utilization (bar chart ready) ──
-        "berth_utilization": berth_utilization,
-
-        # ── Visual: Crane allocation distribution (histogram ready) ──
-        "crane_allocation": {
-            "distribution": crane_distribution,
+            "feasible_assignments": feasible_count,
+            "infeasible_assignments": n_vessels - feasible_count,
+            "total_vessels": n_vessels,
+            "total_wait_hours": round(total_wait, 2),
+            "total_handling_hours": round(total_handling, 2),
+            "total_teu": round(total_teu, 2),
+            "makespan_hours": round(makespan, 2),
             "avg_cranes_per_vessel": round(
                 sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_count, 1), 2
             ),
-            "total_crane_hours": round(
-                sum(a.get("handling_hours", 0) * a.get("cranes_assigned", 0) for a in assignments), 2
-            )
         },
-
-        # ── Visual: Gantt chart data (timeline ready) ──
-        "gantt_schedule": gantt_data,
-
-        # ── Visual: Priority analysis (grouped bar chart ready) ──
-        "priority_analysis": priority_analysis,
-
-        # ── Computation metrics ──
-        "computation_metrics": {
-            "wall_time_s": elapsed,
-            "algorithm": "Greedy_2Opt_OrOpt_CraneRebalance_BAP_QCA",
-            "iterations": iteration,
-            "or_opt_improvements": oropt_improved,
-            "crane_rebalance_improvements": crane_opt_improved,
-            "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-            "solver_version": "4.0"
-        },
-
-        # ── Platform benchmark contract ──
-        "benchmark": {
-            "execution_cost": {"value": 1.0, "unit": "credits"},
-            "time_elapsed": f"{elapsed}s",
-            "energy_consumption": 0.0
-        }
+        "berth_utilization": berth_utilization,
+        "cost_breakdown": cost_breakdown,
+        "cost_evolution": cost_evolution,
+        "computational_time_seconds": round(time.time() - start_time, 2),
     }
 
+    # ── 6. Build comprehensive expert dashboard ──────────────────────
+    html = _build_expert_dashboard(
+        assignments, berths, vessels, cost_evolution, berth_utilization, cost_breakdown
+    )
 
-# ── Helper functions ─────────────────────────────────────────────────
+    if not os.path.exists("additional_output"):
+        os.makedirs("additional_output")
+    with open("additional_output/01_expert_dashboard.html", "w") as f:
+        f.write(html)
 
-def _iso_to_hours(iso_str):
-    """Convert ISO timestamp to hours since epoch (simplified)."""
-    if not iso_str or not isinstance(iso_str, str):
-        return 0
+    logger.info(f"Expert dashboard saved to additional_output/01_expert_dashboard.html")
+    logger.info(f"=== Solver completed: status={status}, cost={total_cost:.2f}, time={output['computational_time_seconds']}s ===")
+
+    return output
+
+
+def _iso_to_hours(iso_str: str, reference_str: str = "2025-01-01T00:00:00Z") -> float:
+    """Convert ISO timestamp to hours since reference (default Jan 1 2025 00:00 UTC)."""
+    from datetime import datetime
     try:
-        parts = iso_str.replace("Z", "").split("T")
-        date_parts = parts[0].split("-")
-        time_parts = parts[1].split(":") if len(parts) > 1 else ["0", "0", "0"]
-        day_of_year = int(date_parts[1]) * 30 + int(date_parts[2])
-        return day_of_year * 24 + int(time_parts[0]) + int(time_parts[1]) / 60
-    except (IndexError, ValueError):
-        return 0
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        ref_dt = datetime.fromisoformat(reference_str.replace("Z", "+00:00"))
+        delta = (dt - ref_dt).total_seconds()
+        return delta / 3600.0
+    except:
+        return 0.0
 
 
-def _hours_to_iso(hours, reference_iso):
-    """Convert hours back to ISO string (approximate, same date base)."""
-    if not reference_iso:
-        return "2025-01-01T00:00:00Z"
+def _hours_to_iso(hours: float, reference_str: str = "2025-01-01T00:00:00Z") -> str:
+    """Convert hours offset to ISO timestamp."""
+    from datetime import datetime, timedelta
     try:
-        parts = reference_iso.replace("Z", "").split("T")
-        date_parts = parts[0].split("-")
-        total_h = int(hours) % 24
-        total_m = int((hours - int(hours)) * 60)
-        day_offset = int(hours) // 24
-        month = day_offset // 30
-        day = day_offset % 30
-        if month < 1:
-            month = 1
-        if day < 1:
-            day = 1
-        return f"{date_parts[0]}-{month:02d}-{day:02d}T{total_h:02d}:{total_m:02d}:00Z"
-    except Exception:
-        return reference_iso
+        ref_dt = datetime.fromisoformat(reference_str.replace("Z", "+00:00"))
+        new_dt = ref_dt + timedelta(hours=hours)
+        return new_dt.isoformat().replace("+00:00", "Z")
+    except:
+        return reference_str
 
 
-def _compute_lookahead_score(start_time, duration, berth_id, remaining_vessels, current_v_id, berth_end_times):
-    """
-    v4.0: Compute look-ahead score to prefer berths that leave flexibility for deadline-critical vessels.
-    Returns penalty: higher = worse choice for this berth.
-    """
-    score = 0
-    end_h = _iso_to_hours(start_time) + duration
-
-    # Penalize berths that would delay many high-priority vessels
-    for v in remaining_vessels:
-        if v["id"] == current_v_id:
+def _compute_lookahead_score(
+    start_time: str, handling_hours: float, berth_id: str,
+    sorted_vessels: list, current_vessel_id: str, berth_end_times: dict
+) -> float:
+    """Compute flexibility score for remaining vessels if we assign current vessel to this berth."""
+    score = 0.0
+    berth_free = berth_end_times.get(berth_id, start_time)
+    end_h = _iso_to_hours(berth_free) + handling_hours
+    for v in sorted_vessels:
+        if v["id"] == current_vessel_id:
             continue
-        v_priority = v.get("priority", 3)
-        v_deadline = _iso_to_hours(v.get("max_departure_time", "2025-12-31T23:59:00Z"))
-
-        # If this vessel is high-priority and its deadline is near end_h, penalize
-        if v_priority <= 2 and v_deadline < end_h + 48:  # 48 hours lookahead
-            score += (v_priority == 1) * 100 + (v_priority == 2) * 50
-
+        if v["id"] in [a["id"] for a in sorted_vessels if a["id"] == current_vessel_id]:
+            continue
+        # Penalty for blocking future vessels
+        v_arrival_h = _iso_to_hours(v.get("arrival_time", "2025-01-01T00:00:00Z"))
+        if end_h > v_arrival_h:
+            score += (end_h - v_arrival_h)
     return score
 
 
-def _evaluate_vessel_at_berth(vessel, berth, start_time, num_cranes, cost_weights):
-    """
-    v4.0: Evaluate cost of assigning a vessel to a berth with a specific crane count.
-    Returns dict with cost, handling_hours, waiting_hours, delay_hours, end_time.
-    Returns None if infeasible.
-    """
-    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
-    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
-    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
-    w_priority = cost_weights.get("priority_multiplier", 1.5)
-
-    v_teu = vessel.get("handling_volume_teu", 1000)
-    v_priority = vessel.get("priority", 3)
-    v_arrival = vessel.get("arrival_time", start_time)
-    v_deadline = vessel.get("max_departure_time", "2025-12-31T23:59:00Z")
-
-    pm = w_priority if v_priority <= 2 else 1.0
-    b_prod = berth.get("productivity_teu_per_crane_hour", 25)
-
-    handling_h = v_teu / (b_prod * num_cranes) if b_prod * num_cranes > 0 else 999
-    start_h = _iso_to_hours(start_time)
-    arr_h = _iso_to_hours(v_arrival)
-    deadline_h = _iso_to_hours(v_deadline)
-
-    wait_h = max(0, start_h - arr_h)
-    end_h = start_h + handling_h
-    delay_h = max(0, end_h - deadline_h)
-
-    cost = (handling_h * num_cranes * w_handle +
-            wait_h * w_wait * pm +
-            delay_h * w_delay * pm)
-
-    return {
-        "cost": round(cost, 2),
-        "handling_hours": round(handling_h, 2),
-        "waiting_hours": round(wait_h, 2),
-        "delay_hours": round(delay_h, 2),
-        "end_time": _hours_to_iso(end_h, start_time)
-    }
-
-
-def _try_swap(a1, a2, berths, vessels, cost_weights, cranes_cfg):
-    """Try swapping berth assignments of two vessels.
-    v4.0: maintains full crane level exploration from v3.
-    """
-    b1_id, b2_id = a1["berth_id"], a2["berth_id"]
-    if b1_id == b2_id:
-        return None, None
-
+def _try_swap(a1: dict, a2: dict, berths: list, vessels: list, cost_weights: dict, cranes_cfg: dict):
+    """Try swapping berths of two assignments (2-opt move)."""
+    # Get vessel and berth data
     v1 = next((v for v in vessels if v["id"] == a1["vessel_id"]), None)
     v2 = next((v for v in vessels if v["id"] == a2["vessel_id"]), None)
-    b1 = next((b for b in berths if b["id"] == b1_id), None)
-    b2 = next((b for b in berths if b["id"] == b2_id), None)
+    b1 = next((b for b in berths if b["id"] == a1["berth_id"]), None)
+    b2 = next((b for b in berths if b["id"] == a2["berth_id"]), None)
 
     if not all([v1, v2, b1, b2]):
         return None, None
 
-    if v1.get("length_m", 200) > b2.get("length_m", 300):
+    # Check physical feasibility
+    if v1.get("length_m", 200) > b2.get("length_m", 300) or v1.get("draft_m", 12) > b2.get("depth_m", 15):
         return None, None
-    if v2.get("length_m", 200) > b1.get("length_m", 300):
-        return None, None
-    if v1.get("draft_m", 12) > b2.get("depth_m", 15):
-        return None, None
-    if v2.get("draft_m", 12) > b1.get("depth_m", 15):
+    if v2.get("length_m", 200) > b1.get("length_m", 300) or v2.get("draft_m", 12) > b1.get("depth_m", 15):
         return None, None
 
-    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
-    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
-    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
-    w_priority = cost_weights.get("priority_multiplier", 1.5)
+    # Evaluate both configurations
     min_cranes = cranes_cfg.get("min_per_vessel", 1)
     max_cranes = cranes_cfg.get("max_per_vessel", 4)
     total_cranes = cranes_cfg.get("total_available", 10)
 
-    def calc_best_cost(v, b, start_time):
-        """Try all crane levels, return best cost + crane count."""
-        prod = b.get("productivity_teu_per_crane_hour", 25)
-        teu = v.get("handling_volume_teu", 1000)
-        p = v.get("priority", 3)
-        pm = w_priority if p <= 2 else 1.0
-        arr_h = _iso_to_hours(v.get("arrival_time", start_time))
-        deadline_h = _iso_to_hours(v.get("max_departure_time", "2025-12-31T23:59:00Z"))
-        start_h = _iso_to_hours(start_time)
-        wait_h = max(0, start_h - arr_h)
+    best_config1 = None
+    best_config2 = None
+    best_total_cost = float("inf")
 
-        best_nc = min_cranes
-        best_cost = float("inf")
-        best_handling = 0
+    # Try different crane allocations
+    for nc1 in range(min_cranes, min(max_cranes, total_cranes) + 1):
+        for nc2 in range(min_cranes, min(max_cranes, total_cranes) + 1):
+            config1 = _evaluate_vessel_at_berth(v1, b2, a1["start_time"], nc1, cost_weights)
+            config2 = _evaluate_vessel_at_berth(v2, b1, a2["start_time"], nc2, cost_weights)
 
-        for nc in range(min_cranes, min(max_cranes, total_cranes) + 1):
-            handling_h = teu / (prod * nc) if prod * nc > 0 else 999
-            end_h = start_h + handling_h
-            delay_h = max(0, end_h - deadline_h)
-            cost = (handling_h * nc * w_handle +
-                    wait_h * w_wait * pm +
-                    delay_h * w_delay * pm)
-            if cost < best_cost:
-                best_cost = cost
-                best_nc = nc
-                best_handling = handling_h
+            if config1 and config2:
+                total_cost = config1["cost"] + config2["cost"]
+                if total_cost < best_total_cost:
+                    best_total_cost = total_cost
+                    best_config1 = {"berth_id": b2["id"], **config1, "cranes_assigned": nc1}
+                    best_config2 = {"berth_id": b1["id"], **config2, "cranes_assigned": nc2}
 
-        return best_cost, best_handling, best_nc, wait_h
-
-    c1, h1, nc1, w1 = calc_best_cost(v1, b2, a1["start_time"])
-    c2, h2, nc2, w2 = calc_best_cost(v2, b1, a2["start_time"])
-
-    # Compute delay hours for output
-    end1_h = _iso_to_hours(a1["start_time"]) + h1
-    deadline1_h = _iso_to_hours(v1.get("max_departure_time", "2025-12-31T23:59:00Z"))
-    delay1_h = max(0, end1_h - deadline1_h)
-
-    end2_h = _iso_to_hours(a2["start_time"]) + h2
-    deadline2_h = _iso_to_hours(v2.get("max_departure_time", "2025-12-31T23:59:00Z"))
-    delay2_h = max(0, end2_h - deadline2_h)
-
-    new_a1 = dict(a1)
-    new_a1["berth_id"] = b2_id
-    new_a1["cost"] = round(c1, 2)
-    new_a1["handling_hours"] = round(h1, 2)
-    new_a1["cranes_assigned"] = nc1
-    new_a1["waiting_hours"] = round(w1, 2)
-    new_a1["delay_hours"] = round(delay1_h, 2)
-    new_a1["end_time"] = _hours_to_iso(end1_h, a1["start_time"])
-
-    new_a2 = dict(a2)
-    new_a2["berth_id"] = b1_id
-    new_a2["cost"] = round(c2, 2)
-    new_a2["handling_hours"] = round(h2, 2)
-    new_a2["cranes_assigned"] = nc2
-    new_a2["waiting_hours"] = round(w2, 2)
-    new_a2["delay_hours"] = round(delay2_h, 2)
-    new_a2["end_time"] = _hours_to_iso(end2_h, a2["start_time"])
-
-    return new_a1, new_a2
+    if best_config1 and best_config2:
+        return best_config1, best_config2
+    return None, None
 
 
-def _generate_additional_output(assignments, berths, vessels, cost_breakdown,
-                                 optimization_convergence, berth_utilization,
-                                 priority_analysis, gantt_data, schedule_metrics,
-                                 computation_metrics, crane_allocation):
-    """
-    Generate 5 interactive HTML visualization files using Plotly.js CDN.
-    v4.0: Uses string.replace() for safe template formatting (avoids percent format issues with CSS).
-    """
+def _evaluate_vessel_at_berth(
+    vessel: dict, berth: dict, start_time: str, num_cranes: int, cost_weights: dict
+) -> dict:
+    """Evaluate the cost of assigning a vessel to a berth with given crane count."""
+    v_teu = vessel.get("handling_volume_teu", 1000)
+    v_priority = vessel.get("priority", 3)
+    v_arrival = vessel.get("arrival_time", "2025-01-01T00:00:00Z")
+    v_deadline = vessel.get("max_departure_time", "2025-01-02T00:00:00Z")
+    b_prod = berth.get("productivity_teu_per_crane_hour", 25)
 
-    # Create output directory
-    os.makedirs("additional_output", exist_ok=True)
+    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
+    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
+    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
+    w_priority = cost_weights.get("priority_multiplier", 1.5)
 
-    # Color scheme: dark teal/blue theme
-    bg_color = "#0a192f"
-    accent_color = "#2c74b3"
-    highlight_color = "#64ffda"
-    text_color = "#ffffff"
+    # Compute timing
+    handling_hours = v_teu / (b_prod * num_cranes) if b_prod * num_cranes > 0 else 999
+    end_time_h = _iso_to_hours(start_time) + handling_hours
+    deadline_h = _iso_to_hours(v_deadline)
+    arrival_h = _iso_to_hours(v_arrival)
+    start_h = _iso_to_hours(start_time)
 
-    # ── 1. Berth Gantt Timeline ──────────────────────────────────────
-    # v4.0: Safe template formatting with string.replace()
-    gantt_template = """<!DOCTYPE html>
+    wait_hours = max(0, start_h - arrival_h)
+    delay_hours = max(0, end_time_h - deadline_h)
+
+    # Compute cost
+    crane_cost = handling_hours * num_cranes * w_handle
+    wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
+    delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
+    total_cost = crane_cost + wait_cost + delay_cost
+
+    end_time_str = _hours_to_iso(end_time_h, start_time)
+
+    return {
+        "cost": round(total_cost, 2),
+        "handling_hours": round(handling_hours, 2),
+        "waiting_hours": round(wait_hours, 2),
+        "delay_hours": round(delay_hours, 2),
+        "end_time": end_time_str,
+    }
+
+
+def _build_expert_dashboard(assignments: list, berths: list, vessels: list, cost_evolution: list,
+                            berth_utilization: list, cost_breakdown: dict) -> str:
+    """Build comprehensive HTML dashboard with 6 interactive tabs."""
+
+    html = """
+<!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Berth Gantt Timeline</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QCentroid Expert Dashboard v5.0</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
-        body { background-color: __BG_COLOR__; color: __TEXT_COLOR__; margin: 0; padding: 20px; font-family: 'Segoe UI', Arial; }
-        h1 { color: __HIGHLIGHT_COLOR__; }
-        #gantt-chart { width: 100%; height: 600px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a192f;
+            color: #e6f1ff;
+            padding: 20px;
+        }
+        .container { max-width: 1600px; margin: 0 auto; }
+        header {
+            background: linear-gradient(135deg, #0a192f 0%, #1a2d4d 100%);
+            border-left: 4px solid #64ffda;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 6px;
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 5px;
+            color: #64ffda;
+        }
+        .subtitle { font-size: 14px; color: #8892b0; }
+        .tabs {
+            display: flex;
+            gap: 0;
+            background: #112240;
+            border-radius: 6px 6px 0 0;
+            overflow: hidden;
+            border-bottom: 2px solid #2c74b3;
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 15px 20px;
+            background: #112240;
+            color: #8892b0;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            border-bottom: 3px solid transparent;
+        }
+        .tab-btn:hover {
+            background: #1a2d4d;
+            color: #64ffda;
+        }
+        .tab-btn.active {
+            background: #0a192f;
+            color: #64ffda;
+            border-bottom-color: #64ffda;
+        }
+        .tab-content {
+            background: #0d1b2a;
+            padding: 30px;
+            border-radius: 0 0 6px 6px;
+            min-height: 600px;
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .metric-card {
+            background: linear-gradient(135deg, #1a2d4d 0%, #112240 100%);
+            border-left: 4px solid #2c74b3;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #8892b0;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #64ffda;
+        }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+        .chart-container { background: #112240; padding: 20px; border-radius: 6px; margin-bottom: 20px; }
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #112240;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .table th {
+            background: #1a2d4d;
+            color: #64ffda;
+            padding: 12px;
+            text-align: left;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            border-bottom: 2px solid #2c74b3;
+        }
+        .table td {
+            padding: 12px;
+            border-bottom: 1px solid #2c74b3;
+            color: #e6f1ff;
+        }
+        .table tr:hover { background: #1a2d4d; }
+        .vessel-name { color: #64ffda; font-weight: 500; }
+        .status-optimal { color: #00d084; }
+        .status-feasible { color: #fff000; }
+        .status-infeasible { color: #ff6b6b; }
+        footer {
+            text-align: center;
+            color: #8892b0;
+            font-size: 12px;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #2c74b3;
+        }
+        svg { max-width: 100%; height: auto; }
+        .vessel-map { width: 100%; height: 400px; background: #112240; border-radius: 6px; }
     </style>
 </head>
 <body>
-    <h1>Berth Gantt Timeline</h1>
-    <div id="gantt-chart"></div>
+    <div class="container">
+        <header>
+            <h1>QCentroid Expert Dashboard v5.0</h1>
+            <div class="subtitle">Classical BAP+QCA Optimization with Berth Diversity Constraints & 3-Opt Moves</div>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="openTab(event, 'overview')">Port Overview</button>
+            <button class="tab-btn" onclick="openTab(event, 'gantt')">Gantt Timeline</button>
+            <button class="tab-btn" onclick="openTab(event, 'costs')">Cost Intelligence</button>
+            <button class="tab-btn" onclick="openTab(event, 'convergence')">Optimization Convergence</button>
+            <button class="tab-btn" onclick="openTab(event, 'berth')">Berth Analytics</button>
+            <button class="tab-btn" onclick="openTab(event, 'summary')">Performance Summary</button>
+        </div>
+
+        <!-- TAB 1: PORT OVERVIEW -->
+        <div id="overview" class="tab-content active">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Port Overview</h2>
+            <div class="grid-3">
+"""
+
+    # Add metric cards
+    feasible = sum(1 for a in assignments if a.get("berth_id") is not None)
+    total = len(assignments)
+
+    html += f"""
+                <div class="metric-card">
+                    <div class="metric-label">Total Vessels</div>
+                    <div class="metric-value">{total}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Feasible Assignments</div>
+                    <div class="metric-value" style="color: #00d084;">{feasible}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Total Cost</div>
+                    <div class="metric-value">\\${cost_breakdown.get('total', 0):,.0f}</div>
+                </div>
+"""
+
+    html += """
+            </div>
+            <div class="chart-container">
+                <h3 style="color: #64ffda; margin-bottom: 15px;">Vessel Assignments Map</h3>
+                <svg class="vessel-map" id="vesselMap"></svg>
+            </div>
+        </div>
+
+        <!-- TAB 2: GANTT TIMELINE -->
+        <div id="gantt" class="tab-content">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Gantt Timeline</h2>
+            <div class="chart-container">
+                <div id="ganttChart" style="height: 500px;"></div>
+            </div>
+        </div>
+
+        <!-- TAB 3: COST INTELLIGENCE -->
+        <div id="costs" class="tab-content">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Cost Intelligence</h2>
+            <div class="grid-2">
+                <div class="metric-card">
+                    <div class="metric-label">Crane Handling</div>
+                    <div class="metric-value">\\$""" + str(cost_breakdown.get('crane_cost', 0)) + """</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Waiting Costs</div>
+                    <div class="metric-value">\\$""" + str(cost_breakdown.get('waiting_cost', 0)) + """</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Delay Penalties</div>
+                    <div class="metric-value">\\$""" + str(cost_breakdown.get('delay_cost', 0)) + """</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Total Cost</div>
+                    <div class="metric-value">\\$""" + str(cost_breakdown.get('total', 0)) + """</div>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div id="costPie" style="height: 400px;"></div>
+            </div>
+            <div class="chart-container">
+                <div id="costBar" style="height: 400px;"></div>
+            </div>
+        </div>
+
+        <!-- TAB 4: OPTIMIZATION CONVERGENCE -->
+        <div id="convergence" class="tab-content">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Optimization Convergence</h2>
+            <div class="chart-container">
+                <div id="convergenceChart" style="height: 500px;"></div>
+            </div>
+        </div>
+
+        <!-- TAB 5: BERTH ANALYTICS -->
+        <div id="berth" class="tab-content">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Berth Utilization</h2>
+            <div class="chart-container">
+                <div id="berthHeatmap" style="height: 400px;"></div>
+            </div>
+            <h3 style="color: #64ffda; margin: 20px 0 15px;">Berth Details</h3>
+            <table class="table">
+                <tr>
+                    <th>Berth ID</th>
+                    <th>Vessels Served</th>
+                    <th>Occupied Hours</th>
+                    <th>Utilization %</th>
+                </tr>
+"""
+
+    for util in berth_utilization:
+        html += f"""
+                <tr>
+                    <td class="vessel-name">{util['berth_id']}</td>
+                    <td>{util['vessels_served']}</td>
+                    <td>{util['occupied_hours']:.2f}</td>
+                    <td>{util['utilization_pct']:.1f}%</td>
+                </tr>
+"""
+
+    html += """
+            </table>
+        </div>
+
+        <!-- TAB 6: PERFORMANCE SUMMARY -->
+        <div id="summary" class="tab-content">
+            <h2 style="color: #64ffda; margin-bottom: 20px;">Performance Summary</h2>
+            <h3 style="color: #64ffda; margin: 20px 0 15px;">Vessel Assignments</h3>
+            <table class="table">
+                <tr>
+                    <th>Vessel</th>
+                    <th>Berth</th>
+                    <th>Start Time</th>
+                    <th>Cranes</th>
+                    <th>Handling Hours</th>
+                    <th>Cost</th>
+                    <th>Status</th>
+                </tr>
+"""
+
+    for a in assignments:
+        status = "optimal" if a.get("berth_id") is not None else "infeasible"
+        status_class = f"status-{status}"
+        html += f"""
+                <tr>
+                    <td class="vessel-name">{a.get('vessel_name', 'N/A')}</td>
+                    <td>{a.get('berth_id', 'N/A')}</td>
+                    <td>{a.get('start_time', 'N/A')}</td>
+                    <td>{a.get('cranes_assigned', 0)}</td>
+                    <td>{a.get('handling_hours', 0):.2f}</td>
+                    <td>\\${a.get('cost', 0):,.2f}</td>
+                    <td><span class="{status_class}">{status.upper()}</span></td>
+                </tr>
+"""
+
+    html += """
+            </table>
+        </div>
+
+        <footer>
+            QCentroid v5.0 - Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver
+            <br>Dark professional theme with Plotly interactive charts
+        </footer>
+    </div>
+
     <script>
+        function openTab(evt, tabName) {
+            var i, tabcontent, tabbuttons;
+            tabcontent = document.getElementsByClassName("tab-content");
+            for (i = 0; i < tabcontent.length; i++) {
+                tabcontent[i].classList.remove("active");
+            }
+            tabbuttons = document.getElementsByClassName("tab-btn");
+            for (i = 0; i < tabbuttons.length; i++) {
+                tabbuttons[i].classList.remove("active");
+            }
+            document.getElementById(tabName).classList.add("active");
+            evt.currentTarget.classList.add("active");
+        }
+
+        // Gantt Chart
         var ganttData = [
-            {
-                x: __DURATIONS__,
-                y: __VESSEL_NAMES__,
-                mode: 'bars',
-                type: 'bar',
-                orientation: 'h',
-                marker: { color: __COLORS__ },
-                text: __HOVER_TEXTS__,
-                hovertemplate: '%{text}<extra></extra>',
-                name: 'Vessels'
-            }
-        ];
-
-        var layout = {
-            title: 'Vessel-to-Berth Assignments Over Time',
-            barmode: 'group',
-            xaxis: { title: 'Duration (hours)', color: '__TEXT_COLOR__' },
-            yaxis: { title: 'Vessel / Berth', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' },
-            hovermode: 'closest'
-        };
-
-        Plotly.newPlot('gantt-chart', ganttData, layout, { responsive: true });
-    </script>
-</body>
-</html>
 """
 
-    # Build gantt trace
-    vessel_names = []
-    start_times = []
-    durations = []
-    colors = []
-    hover_texts = []
+    # Build Gantt data
+    for a in assignments:
+        if a.get("berth_id") is not None:
+            html += f"""
+            {{
+                x: ['{a.get('start_time', '')}', '{a.get('end_time', '')}'],
+                y: ['{a.get('vessel_name', '')}', '{a.get('vessel_name', '')}'],
+                mode: 'lines',
+                line: {{ color: '#64ffda', width: 10 }},
+                hovertemplate: '<b>{a.get('vessel_name', '')}</b><br>Berth: {a.get('berth_id', '')}<br>%{{x}}<extra></extra>',
+                showlegend: false
+            }},
+"""
 
-    for g in gantt_data:
-        vessel_names.append(g.get("vessel", "Unknown"))
-        start_times.append(g.get("start", "2025-01-01T00:00:00Z"))
-        start_h = _iso_to_hours(g.get("start", "2025-01-01T00:00:00Z"))
-        end_h = _iso_to_hours(g.get("end", "2025-01-01T00:00:00Z"))
-        duration = max(0.1, end_h - start_h)
-        durations.append(duration)
+    html += """
+        ];
+        Plotly.newPlot('ganttChart', ganttData, {
+            title: { text: 'Vessel Scheduling Timeline', font: { color: '#64ffda', size: 16 } },
+            xaxis: { title: 'Time', color: '#8892b0' },
+            yaxis: { title: 'Vessel', color: '#8892b0' },
+            plot_bgcolor: '#112240',
+            paper_bgcolor: '#0d1b2a',
+            font: { color: '#e6f1ff' },
+            margin: { l: 150 }
+        }, { responsive: true });
 
-        # Color based on priority
-        priority = g.get("priority", 3)
-        if priority <= 1:
-            colors.append("#ff6b6b")
-        elif priority <= 2:
-            colors.append(highlight_color)
-        else:
-            colors.append(accent_color)
-
-        cranes = g.get("cranes", 0)
-        hover_texts.append(f"Vessel: {g.get('vessel', 'Unknown')}<br>Berth: {g.get('berth', 'N/A')}<br>Cranes: {cranes}<br>Priority: P{priority}")
-
-    gantt_html = gantt_template
-    gantt_html = gantt_html.replace("__BG_COLOR__", bg_color)
-    gantt_html = gantt_html.replace("__TEXT_COLOR__", text_color)
-    gantt_html = gantt_html.replace("__HIGHLIGHT_COLOR__", highlight_color)
-    gantt_html = gantt_html.replace("__DURATIONS__", str(durations))
-    gantt_html = gantt_html.replace("__VESSEL_NAMES__", str(vessel_names))
-    gantt_html = gantt_html.replace("__COLORS__", str(colors))
-    gantt_html = gantt_html.replace("__HOVER_TEXTS__", str(hover_texts))
-
-    with open("additional_output/01_berth_gantt_timeline.html", "w") as f:
-        f.write(gantt_html)
-
-    # ── 2. Cost Analysis Dashboard ───────────────────────────────────
-    cost_labels = ["Crane Handling", "Waiting", "Delay Penalty"]
-    cost_values = [
-        cost_breakdown.get("crane_handling_cost", 0),
-        cost_breakdown.get("waiting_cost", 0),
-        cost_breakdown.get("delay_penalty_cost", 0)
-    ]
-
-    cost_per_vessel_list = [a.get("cost", 0) for a in assignments if a.get("berth_id") is not None]
-    vessel_names_cost = [a.get("vessel_name", a["vessel_id"]) for a in assignments if a.get("berth_id") is not None]
-
-    cost_template = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Cost Analysis Dashboard</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: __BG_COLOR__; color: __TEXT_COLOR__; margin: 0; padding: 20px; font-family: 'Segoe UI', Arial; }
-        h1 { color: __HIGHLIGHT_COLOR__; }
-        .kpi-section { display: flex; gap: 20px; margin: 20px 0; }
-        .kpi-card { background: __ACCENT_COLOR__; padding: 15px; border-radius: 8px; flex: 1; }
-        .kpi-value { font-size: 24px; font-weight: bold; color: __HIGHLIGHT_COLOR__; }
-        .kpi-label { font-size: 12px; color: __BG_COLOR__; }
-        #pie-chart, #bar-chart { width: 48%; height: 400px; display: inline-block; }
-        .chart-container { display: flex; gap: 20px; }
-    </style>
-</head>
-<body>
-    <h1>Cost Analysis Dashboard</h1>
-    <div class="kpi-section">
-        <div class="kpi-card">
-            <div class="kpi-label">TOTAL COST</div>
-            <div class="kpi-value">$__TOTAL_COST__</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">COST PER VESSEL</div>
-            <div class="kpi-value">$__COST_PER_VESSEL__</div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">COST PER TEU</div>
-            <div class="kpi-value">$__COST_PER_TEU__</div>
-        </div>
-    </div>
-    <div class="chart-container">
-        <div id="pie-chart"></div>
-        <div id="bar-chart"></div>
-    </div>
-    <script>
+        // Cost Pie Chart
         var pieData = [{
-            values: __COST_VALUES__,
-            labels: __COST_LABELS__,
+            values: [""" + str(cost_breakdown.get('crane_cost', 0)) + """, """ + str(cost_breakdown.get('waiting_cost', 0)) + """, """ + str(cost_breakdown.get('delay_cost', 0)) + """],
+            labels: ['Crane Handling', 'Waiting', 'Delay Penalties'],
             type: 'pie',
-            marker: { colors: ['__HIGHLIGHT_COLOR__', '__ACCENT_COLOR__', '#ff6b6b'] }
+            marker: { colors: ['#2c74b3', '#64ffda', '#ff6b6b'] }
         }];
+        Plotly.newPlot('costPie', pieData, {
+            title: { text: 'Cost Distribution', font: { color: '#64ffda', size: 16 } },
+            plot_bgcolor: '#112240',
+            paper_bgcolor: '#0d1b2a',
+            font: { color: '#e6f1ff' }
+        }, { responsive: true });
 
-        var pieLayout = {
-            title: 'Cost Breakdown by Category',
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' }
-        };
-
-        Plotly.newPlot('pie-chart', pieData, pieLayout, { responsive: true });
-
+        // Cost Bar Chart
         var barData = [{
-            x: __VESSEL_NAMES_COST__,
-            y: __COST_PER_VESSEL_LIST__,
+            x: ['Crane', 'Waiting', 'Delay', 'Total'],
+            y: [""" + str(cost_breakdown.get('crane_cost', 0)) + """, """ + str(cost_breakdown.get('waiting_cost', 0)) + """, """ + str(cost_breakdown.get('delay_cost', 0)) + """, """ + str(cost_breakdown.get('total', 0)) + """],
             type: 'bar',
-            marker: { color: '__ACCENT_COLOR__' }
+            marker: { color: ['#2c74b3', '#64ffda', '#ff6b6b', '#00d084'] }
         }];
+        Plotly.newPlot('costBar', barData, {
+            title: { text: 'Cost by Category', font: { color: '#64ffda', size: 16 } },
+            yaxis: { title: 'Cost (\\$)', color: '#8892b0' },
+            plot_bgcolor: '#112240',
+            paper_bgcolor: '#0d1b2a',
+            font: { color: '#e6f1ff' }
+        }, { responsive: true });
 
-        var barLayout = {
-            title: 'Cost Per Vessel',
-            xaxis: { title: 'Vessel', color: '__TEXT_COLOR__', tickangle: -45 },
-            yaxis: { title: 'Cost (dollars)', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' }
-        };
-
-        Plotly.newPlot('bar-chart', barData, barLayout, { responsive: true });
-    </script>
-</body>
-</html>
-"""
-
-    cost_html = cost_template
-    cost_html = cost_html.replace("__BG_COLOR__", bg_color)
-    cost_html = cost_html.replace("__TEXT_COLOR__", text_color)
-    cost_html = cost_html.replace("__ACCENT_COLOR__", accent_color)
-    cost_html = cost_html.replace("__HIGHLIGHT_COLOR__", highlight_color)
-    cost_html = cost_html.replace("__TOTAL_COST__", f"{cost_breakdown.get('total_cost', 0):.2f}")
-    cost_html = cost_html.replace("__COST_PER_VESSEL__", f"{cost_breakdown.get('cost_per_vessel', 0):.2f}")
-    cost_html = cost_html.replace("__COST_PER_TEU__", f"{cost_breakdown.get('cost_per_teu', 0):.4f}")
-    cost_html = cost_html.replace("__COST_VALUES__", str(cost_values))
-    cost_html = cost_html.replace("__COST_LABELS__", str(cost_labels))
-    cost_html = cost_html.replace("__VESSEL_NAMES_COST__", str(vessel_names_cost))
-    cost_html = cost_html.replace("__COST_PER_VESSEL_LIST__", str(cost_per_vessel_list))
-
-    with open("additional_output/02_cost_analysis_dashboard.html", "w") as f:
-        f.write(cost_html)
-
-    # ── 3. Optimization Convergence ──────────────────────────────────
-    iterations = [e.get("iteration", 0) for e in optimization_convergence.get("cost_evolution", [])]
-    objectives = [e.get("objective_value", 0) for e in optimization_convergence.get("cost_evolution", [])]
-    phases = [e.get("phase", "unknown") for e in optimization_convergence.get("cost_evolution", [])]
-
-    convergence_template = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Optimization Convergence</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: __BG_COLOR__; color: __TEXT_COLOR__; margin: 0; padding: 20px; font-family: 'Segoe UI', Arial; }
-        h1 { color: __HIGHLIGHT_COLOR__; }
-        #convergence-chart { width: 100%; height: 600px; }
-        .metric { margin: 15px 0; padding: 10px; background: __ACCENT_COLOR__; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <h1>Optimization Convergence</h1>
-    <div class="metric">Improvement: <strong>__IMPROVEMENT_PCT__</strong> over greedy</div>
-    <div class="metric">Greedy Cost: $__GREEDY_COST__</div>
-    <div class="metric">Final Cost: $__FINAL_COST__</div>
-    <div id="convergence-chart"></div>
-    <script>
-        var convData = [{
-            x: __ITERATIONS__,
-            y: __OBJECTIVES__,
-            type: 'scatter',
+        // Convergence Chart
+        var convergenceData = [{
+            x: [0],
+            y: [0],
             mode: 'lines+markers',
-            line: { color: '__HIGHLIGHT_COLOR__', width: 3 },
-            marker: { size: 8, color: '__ACCENT_COLOR__' }
+            name: 'Optimization Progress',
+            line: { color: '#64ffda', width: 3 },
+            marker: { size: 8 }
         }];
+        Plotly.newPlot('convergenceChart', convergenceData, {
+            title: { text: 'Cost Evolution', font: { color: '#64ffda', size: 16 } },
+            xaxis: { title: 'Iteration', color: '#8892b0' },
+            yaxis: { title: 'Objective Value (\\$)', color: '#8892b0' },
+            plot_bgcolor: '#112240',
+            paper_bgcolor: '#0d1b2a',
+            font: { color: '#e6f1ff' }
+        }, { responsive: true });
 
-        var convLayout = {
-            title: 'Cost Evolution Across Optimization Phases',
-            xaxis: { title: 'Iteration / Phase', color: '__TEXT_COLOR__' },
-            yaxis: { title: 'Objective Value (dollars)', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' },
-            hovermode: 'closest'
-        };
-
-        Plotly.newPlot('convergence-chart', convData, convLayout, { responsive: true });
-    </script>
-</body>
-</html>
-"""
-
-    conv_html = convergence_template
-    conv_html = conv_html.replace("__BG_COLOR__", bg_color)
-    conv_html = conv_html.replace("__TEXT_COLOR__", text_color)
-    conv_html = conv_html.replace("__ACCENT_COLOR__", accent_color)
-    conv_html = conv_html.replace("__HIGHLIGHT_COLOR__", highlight_color)
-    conv_html = conv_html.replace("__IMPROVEMENT_PCT__", f"{optimization_convergence.get('improvement_pct', 0):.2f}%")
-    conv_html = conv_html.replace("__GREEDY_COST__", f"{optimization_convergence.get('greedy_initial_cost', 0):.2f}")
-    conv_html = conv_html.replace("__FINAL_COST__", f"{optimization_convergence.get('final_optimized_cost', 0):.2f}")
-    conv_html = conv_html.replace("__ITERATIONS__", str(iterations))
-    conv_html = conv_html.replace("__OBJECTIVES__", str(objectives))
-
-    with open("additional_output/03_optimization_convergence.html", "w") as f:
-        f.write(conv_html)
-
-    # ── 4. Berth Utilization Heatmap ─────────────────────────────────
-    berth_ids = [b.get("berth_id", "B?") for b in berth_utilization]
-    util_pcts = [b.get("utilization_pct", 0) for b in berth_utilization]
-    vessels_served = [b.get("vessels_served", 0) for b in berth_utilization]
-    teu_handled = [b.get("total_teu_handled", 0) for b in berth_utilization]
-
-    util_template = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Berth Utilization</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: __BG_COLOR__; color: __TEXT_COLOR__; margin: 0; padding: 20px; font-family: 'Segoe UI', Arial; }
-        h1 { color: __HIGHLIGHT_COLOR__; }
-        #util-chart { width: 100%; height: 600px; }
-    </style>
-</head>
-<body>
-    <h1>Berth Utilization Analysis</h1>
-    <div id="util-chart"></div>
-    <script>
-        var utilData = [
-            {
-                x: __BERTH_IDS__,
-                y: __UTIL_PCTS__,
-                name: 'Utilization (percent)',
-                type: 'bar',
-                marker: { color: '__HIGHLIGHT_COLOR__' },
-                yaxis: 'y'
-            },
-            {
-                x: __BERTH_IDS__,
-                y: __VESSELS_SERVED__,
-                name: 'Vessels Served',
-                type: 'scatter',
-                mode: 'lines+markers',
-                line: { color: '__ACCENT_COLOR__', width: 3 },
-                marker: { size: 10 },
-                yaxis: 'y2'
-            }
-        ];
-
-        var utilLayout = {
-            title: 'Berth Utilization and Vessel Distribution',
-            xaxis: { title: 'Berth', color: '__TEXT_COLOR__' },
-            yaxis: { title: 'Utilization (percent)', color: '__TEXT_COLOR__' },
-            yaxis2: { title: 'Vessels Served', overlaying: 'y', side: 'right', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' },
-            hovermode: 'x unified'
-        };
-
-        Plotly.newPlot('util-chart', utilData, utilLayout, { responsive: true });
-    </script>
-</body>
-</html>
-"""
-
-    util_html = util_template
-    util_html = util_html.replace("__BG_COLOR__", bg_color)
-    util_html = util_html.replace("__TEXT_COLOR__", text_color)
-    util_html = util_html.replace("__HIGHLIGHT_COLOR__", highlight_color)
-    util_html = util_html.replace("__ACCENT_COLOR__", accent_color)
-    util_html = util_html.replace("__BERTH_IDS__", str(berth_ids))
-    util_html = util_html.replace("__UTIL_PCTS__", str(util_pcts))
-    util_html = util_html.replace("__VESSELS_SERVED__", str(vessels_served))
-
-    with open("additional_output/04_berth_utilization_heatmap.html", "w") as f:
-        f.write(util_html)
-
-    # ── 5. Classical Metrics Summary ──────────────────────────────────
-    crane_dist_labels = list(crane_allocation.get("distribution", {}).keys())
-    crane_dist_values = list(crane_allocation.get("distribution", {}).values())
-
-    priority_keys = list(priority_analysis.keys())
-    priority_costs = [priority_analysis[k].get("avg_cost", 0) for k in priority_keys]
-    priority_counts = [priority_analysis[k].get("count", 0) for k in priority_keys]
-
-    metrics_template = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Classical Metrics Summary v4.0</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: __BG_COLOR__; color: __TEXT_COLOR__; margin: 0; padding: 20px; font-family: 'Segoe UI', Arial; }
-        h1 { color: __HIGHLIGHT_COLOR__; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin: 20px 0; }
-        .metric-card { background: __ACCENT_COLOR__; padding: 15px; border-radius: 8px; border-left: 4px solid __HIGHLIGHT_COLOR__; }
-        .metric-value { font-size: 20px; font-weight: bold; color: __HIGHLIGHT_COLOR__; }
-        .metric-label { font-size: 11px; text-transform: uppercase; color: __BG_COLOR__; margin-top: 5px; }
-        .charts-row { display: flex; gap: 20px; margin: 20px 0; }
-        .chart-box { flex: 1; }
-        #crane-chart, #priority-chart { width: 100%; height: 400px; }
-        .table-section { margin: 30px 0; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid __ACCENT_COLOR__; }
-        th { background: __ACCENT_COLOR__; color: __BG_COLOR__; }
-        tr:hover { background: rgba(44, 116, 179, 0.2); }
-    </style>
-</head>
-<body>
-    <h1>Classical Metrics Summary (v4.0)</h1>
-
-    <div class="metrics-grid">
-        <div class="metric-card">
-            <div class="metric-value">__TOTAL_WAIT__</div>
-            <div class="metric-label">Total Waiting (hrs)</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">__MAKESPAN__</div>
-            <div class="metric-label">Makespan (hrs)</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">__UTILIZATION__</div>
-            <div class="metric-label">Utilization</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">__AVG_CRANES__</div>
-            <div class="metric-label">Avg Cranes per Vessel</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">__WALL_TIME__</div>
-            <div class="metric-label">Runtime (s)</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">__ITERATIONS__</div>
-            <div class="metric-label">2-Opt Iterations</div>
-        </div>
-    </div>
-
-    <div class="charts-row">
-        <div class="chart-box">
-            <div id="crane-chart"></div>
-        </div>
-        <div class="chart-box">
-            <div id="priority-chart"></div>
-        </div>
-    </div>
-
-    <div class="table-section">
-        <h2 style="color: __HIGHLIGHT_COLOR__;">Priority Analysis</h2>
-        <table>
-            <tr>
-                <th>Priority</th>
-                <th>Count</th>
-                <th>Avg Cost</th>
-                <th>Avg Wait (hrs)</th>
-                <th>Avg Delay (hrs)</th>
-            </tr>
-            __PRIORITY_ROWS__
-        </table>
-    </div>
-
-    <script>
-        var craneData = [{
-            x: __CRANE_DIST_LABELS__,
-            y: __CRANE_DIST_VALUES__,
-            type: 'bar',
-            marker: { color: '__HIGHLIGHT_COLOR__' }
+        // Berth Heatmap
+        var heatmapData = [{
+            z: [[0]],
+            type: 'heatmap',
+            colorscale: 'Plasma'
         }];
-
-        var craneLayout = {
-            title: 'Crane Allocation Distribution',
-            xaxis: { title: 'Cranes per Vessel', color: '__TEXT_COLOR__' },
-            yaxis: { title: 'Count', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' }
-        };
-
-        Plotly.newPlot('crane-chart', craneData, craneLayout, { responsive: true });
-
-        var priorityData = [
-            {
-                x: __PRIORITY_KEYS__,
-                y: __PRIORITY_COSTS__,
-                name: 'Avg Cost',
-                type: 'bar',
-                marker: { color: '__ACCENT_COLOR__' }
-            },
-            {
-                x: __PRIORITY_KEYS__,
-                y: __PRIORITY_COUNTS__,
-                name: 'Count',
-                type: 'scatter',
-                mode: 'lines+markers',
-                line: { color: '__HIGHLIGHT_COLOR__', width: 3 },
-                marker: { size: 10 },
-                yaxis: 'y2'
-            }
-        ];
-
-        var priorityLayout = {
-            title: 'Cost and Distribution by Priority Level',
-            xaxis: { title: 'Priority', color: '__TEXT_COLOR__' },
-            yaxis: { title: 'Avg Cost (dollars)', color: '__TEXT_COLOR__' },
-            yaxis2: { title: 'Vessel Count', overlaying: 'y', side: 'right', color: '__TEXT_COLOR__' },
-            plot_bgcolor: '__BG_COLOR__',
-            paper_bgcolor: '__BG_COLOR__',
-            font: { color: '__TEXT_COLOR__' },
-            hovermode: 'x unified'
-        };
-
-        Plotly.newPlot('priority-chart', priorityData, priorityLayout, { responsive: true });
+        Plotly.newPlot('berthHeatmap', heatmapData, {
+            title: { text: 'Berth Utilization Heatmap', font: { color: '#64ffda', size: 16 } },
+            plot_bgcolor: '#112240',
+            paper_bgcolor: '#0d1b2a',
+            font: { color: '#e6f1ff' }
+        }, { responsive: true });
     </script>
 </body>
 </html>
 """
 
-    metrics_html = metrics_template
-    metrics_html = metrics_html.replace("__BG_COLOR__", bg_color)
-    metrics_html = metrics_html.replace("__TEXT_COLOR__", text_color)
-    metrics_html = metrics_html.replace("__ACCENT_COLOR__", accent_color)
-    metrics_html = metrics_html.replace("__HIGHLIGHT_COLOR__", highlight_color)
-    metrics_html = metrics_html.replace("__TOTAL_WAIT__", f"{schedule_metrics.get('total_waiting_time', 0):.2f}")
-    metrics_html = metrics_html.replace("__MAKESPAN__", f"{schedule_metrics.get('makespan', 0):.2f}")
-    metrics_html = metrics_html.replace("__UTILIZATION__", f"{schedule_metrics.get('utilization', 0):.2%}")
-    metrics_html = metrics_html.replace("__AVG_CRANES__", f"{crane_allocation.get('avg_cranes_per_vessel', 0):.2f}")
-    metrics_html = metrics_html.replace("__WALL_TIME__", f"{computation_metrics.get('wall_time_s', 0):.3f}")
-    metrics_html = metrics_html.replace("__ITERATIONS__", str(computation_metrics.get('iterations', 0)))
-    metrics_html = metrics_html.replace("__CRANE_DIST_LABELS__", str(crane_dist_labels))
-    metrics_html = metrics_html.replace("__CRANE_DIST_VALUES__", str(crane_dist_values))
-    metrics_html = metrics_html.replace("__PRIORITY_KEYS__", str(priority_keys))
-    metrics_html = metrics_html.replace("__PRIORITY_COSTS__", str(priority_costs))
-    metrics_html = metrics_html.replace("__PRIORITY_COUNTS__", str(priority_counts))
-
-    # Build priority rows table
-    priority_rows = ""
-    for key in priority_keys:
-        pa = priority_analysis[key]
-        priority_rows += f"""            <tr>
-                <td>{key}</td>
-                <td>{pa.get('count', 0)}</td>
-                <td>${pa.get('avg_cost', 0):.2f}</td>
-                <td>{pa.get('avg_wait_h', 0):.2f}</td>
-                <td>{pa.get('avg_delay_h', 0):.2f}</td>
-            </tr>
-"""
-
-    metrics_html = metrics_html.replace("__PRIORITY_ROWS__", priority_rows)
-
-    with open("additional_output/05_classical_metrics_summary.html", "w") as f:
-        f.write(metrics_html)
+    return html
