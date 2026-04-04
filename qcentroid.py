@@ -1,1069 +1,744 @@
 """
 Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v6.0
-Berth Allocation + Quay Crane Assignment using greedy construction + 2-opt + or-opt + 3-opt + crane rebalancing.
-
-v6.0 changes (Iteration 2 - Barcelona):
-- CRITICAL FIX: Global crane budget enforcement (18 cranes max at any time t)
-- Priority-weighted crane allocation across simultaneously active berths
-- Re-sequencing of all berths after crane adjustments
-- Proper sequential scheduling enforcement
-
-v5.0 changes (Iteration 3):
-- CRITICAL FIX: Berth diversity constraint with soft penalty in greedy phase (prevents all vessels on cheapest berth)
-- Berth load penalty: 5% of average vessel cost per existing assignment (load balancing)
-- 3-opt neighborhood: rotating 3 vessels among 3 berths for additional improvements
-- DYNAMIC EXPERT DASHBOARD: Single comprehensive 01_expert_dashboard.html with 6 tabs:
-  * Port Overview (SVG vessel map with priority coloring)
-  * Gantt Timeline (interactive Plotly Gantt)
-  * Cost Intelligence (KPI cards + donut + bar charts)
-  * Optimization Convergence (line chart with phase markers)
-  * Berth Analytics (utilization heatmap + vessel distribution)
-  * Performance Summary (metric cards + timing breakdown)
-- Dark professional theme (deep teal #0a192f, accents #2c74b3, highlights #64ffda)
-- All Plotly charts via CDN (https://cdn.plot.ly/plotly-2.27.0.min.js)
-
-v4.0 changes:
-- Or-opt moves: single vessel relocation to different berths (explores neighborhood better than 2-opt alone)
-- Enhanced crane allocation: rebalancing pass finds better crane distributions across fleet
-- Time-aware berth selection: look-ahead scoring to prioritize flexibility for deadline-critical vessels
-- Fixed HTML template formatting: replaced percent format strings with string.replace() to avoid CSS/HTML percent character crashes
-- Updated all version strings to 4.0
-
-v3.1 changes:
-- Added additional_output visualizations with interactive Plotly.js charts
-- Expert dashboard with 5 interactive tabs (port overview, timeline, costs, convergence, berth analytics)
-- SVG vessel map color-coded by priority
-- Plotly Gantt chart, donut chart for cost distribution, heatmap for berth utilization
-- Dashboard auto-opens in browser post-optimization
-
-v3.0 changes:
-- Multiple construction heuristics: greedy, time-aware, cost-balanced
-- 2-opt local search for vessel permutations
-- Real-time cost tracking and phase convergence
-- Clean separation of construction and improvement phases
-
-v2.0 changes:
-- Multiple berths (3) with independent scheduling
-- Crane availability constraints (max 18 per time unit)
-- Cost model: vessel_cost * crane_days
-- Greedy construction with simple 2-opt improvement
-
-v1.0 - Initial release:
-- Single berth model
-- Basic crane scheduling
+Berth Allocation + Quay Crane Assignment.
+v6.0: Global crane budget enforcement, priority-weighted crane allocation, re-sequencing.
 """
-
-import random
-import math
-import json
-import os
+import logging
 import time
-import sys
-from datetime import datetime
-from collections import defaultdict, deque
-import webbrowser
-import shutil
-import subprocess
+import itertools
+import os
+import json
+import math
 
-###############################################################################
-# CONFIGURATION & CONSTANTS
-###############################################################################
+from solver_helpers import (_enforce_crane_budget, _resequence_all_berths, _try_swap,
+                            _hours_to_iso, _iso_to_hours, _compute_lookahead_score,
+                            _evaluate_vessel_at_berth)
+from dashboard import _generate_expert_dashboard
 
-# Vessel class/priority weights (for balanced construction)
-PRIORITY_WEIGHTS = {
-    'high': 1.5,
-    'medium': 1.0,
-    'low': 0.5
-}
+logger = logging.getLogger("qcentroid-user-log")
 
-# Global crane budget
-MAX_CRANES = 18
+def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
+    start_time = time.time()
+    logger.info("=== Classical BAP+QCA Greedy-2Opt-OrOpt-3Opt Solver v6.0 ===")
 
-# Local search parameters
-MAX_2OPT_ITERATIONS = 100
-MAX_OROPT_ITERATIONS = 50
-MAX_3OPT_ITERATIONS = 30
+    # ── 1. Parse inputs ──────────────────────────────────────────────
+    vessels = input_data.get("vessels", [])
+    berths = input_data.get("berths", [])
+    cranes_cfg = input_data.get("cranes", {})
+    cost_weights = input_data.get("cost_weights", {})
 
-# Berth-specific parameters
-BERTH_CONFIGS = {
-    'A': {'max_vessels': 8, 'cost_per_slot': 100},
-    'B': {'max_vessels': 6, 'cost_per_slot': 80},
-    'C': {'max_vessels': 7, 'cost_per_slot': 90}
-}
+    total_cranes = cranes_cfg.get("total_available", 10)
+    min_cranes = cranes_cfg.get("min_per_vessel", 1)
+    max_cranes = cranes_cfg.get("max_per_vessel", 4)
+    # v6.0: Allow full crane range in greedy — the crane budget enforcement
+    # handles time-slot-aware allocation after assignment
 
-# Seed for reproducibility
-RANDOM_SEED = 42
+    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
+    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
+    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
+    w_priority = cost_weights.get("priority_multiplier", 1.5)
 
-###############################################################################
-# VESSEL & SCHEDULE DATA STRUCTURES
-###############################################################################
+    n_vessels = len(vessels)
+    n_berths = len(berths)
+    logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
 
-class Vessel:
-    """Represents a vessel with scheduling requirements"""
-    
-    def __init__(self, vessel_id, arrival_time, processing_time, cranes_needed, 
-                 priority='medium', deadline=None, cost_factor=1.0):
-        self.vessel_id = vessel_id
-        self.arrival_time = arrival_time
-        self.processing_time = processing_time
-        self.cranes_needed = cranes_needed
-        self.priority = priority
-        self.deadline = deadline or (arrival_time + 1000)
-        self.cost_factor = cost_factor
-    
-    def __repr__(self):
-        return (f"Vessel({self.vessel_id}, arr={self.arrival_time}, "
-                f"proc={self.processing_time}, cranes={self.cranes_needed}, "
-                f"pri={self.priority})")
+    # v6.0: Berth capacity constraint (tighter)
+    max_vessels_per_berth = math.ceil(n_vessels / n_berths) + 1
+    logger.info(f"Berth capacity limit: {max_vessels_per_berth} vessels per berth")
 
+    # v6.0: Crane budget awareness — with N berths active, each gets ~total_cranes/N
+    crane_budget_per_active = max(min_cranes, total_cranes // max(n_berths, 1))
+    logger.info(f"Crane budget per berth (all active): ~{crane_budget_per_active}")
 
-class BerthSchedule:
-    """Manages vessel schedule for a single berth"""
-    
-    def __init__(self, berth_id):
-        self.berth_id = berth_id
-        self.vessels = []
-        self.start_times = {}
-        self.end_times = {}
-        self.crane_allocations = {}
-    
-    def add_vessel(self, vessel, start_time, crane_count):
-        """Add a vessel to this berth's schedule"""
-        self.vessels.append(vessel)
-        self.start_times[vessel.vessel_id] = start_time
-        self.end_times[vessel.vessel_id] = start_time + vessel.processing_time
-        self.crane_allocations[vessel.vessel_id] = crane_count
-    
-    def remove_vessel(self, vessel_id):
-        """Remove a vessel from schedule"""
-        if vessel_id in self.start_times:
-            self.vessels = [v for v in self.vessels if v.vessel_id != vessel_id]
-            del self.start_times[vessel_id]
-            del self.end_times[vessel_id]
-            del self.crane_allocations[vessel_id]
-    
-    def get_vessel_by_id(self, vessel_id):
-        """Retrieve vessel object by ID"""
-        for v in self.vessels:
-            if v.vessel_id == vessel_id:
-                return v
-        return None
-    
-    def total_cost(self):
-        """Calculate total cost for this berth"""
-        cost = 0
-        for vessel in self.vessels:
-            crane_count = self.crane_allocations.get(vessel.vessel_id, vessel.cranes_needed)
-            cost += vessel.processing_time * crane_count * vessel.cost_factor
-        return cost
+    # Sort vessels by priority (ascending = higher priority first), then arrival
+    sorted_vessels = sorted(vessels, key=lambda v: (v.get("priority", 5), v.get("arrival_time", "")))
 
+    # ── 2. Greedy construction with crane-budget-aware berth balancing (v6.0) ────────
+    assignments = []
+    berth_end_times = {}
+    berth_vessel_count = {b["id"]: 0 for b in berths}  # track vessel counts per berth
+    cost_evolution = []
 
-class Solution:
-    """Complete port scheduling solution with multiple berths"""
-    
-    def __init__(self):
-        self.berth_schedules = {
-            'A': BerthSchedule('A'),
-            'B': BerthSchedule('B'),
-            'C': BerthSchedule('C')
-        }
-        self.unscheduled_vessels = []
-        self.total_cost = 0
-        self.convergence_history = []
-        self.phase_markers = []
-    
-    def assign_vessel(self, vessel, berth_id, start_time, crane_count):
-        """Assign vessel to berth"""
-        self.berth_schedules[berth_id].add_vessel(vessel, start_time, crane_count)
-    
-    def unassign_vessel(self, vessel_id, berth_id):
-        """Remove vessel from berth"""
-        self.berth_schedules[berth_id].remove_vessel(vessel_id)
-    
-    def calculate_total_cost(self):
-        """Sum costs across all berths"""
-        return sum(bs.total_cost() for bs in self.berth_schedules.values())
-    
-    def is_feasible(self):
-        """Check feasibility: no time conflicts, crane budget respected"""
-        # Check time feasibility per berth
-        for berth_id, berth in self.berth_schedules.items():
-            times_used = defaultdict(int)
-            for vessel in berth.vessels:
-                for t in range(self.start_times[vessel.vessel_id], 
-                              self.end_times[vessel.vessel_id]):
-                    times_used[t] += self.crane_allocations.get(vessel.vessel_id, 1)
-            
-            if any(c > MAX_CRANES for c in times_used.values()):
-                return False
-        
-        return True
-    
-    def calculate_crane_usage(self):
-        """Get total crane usage over time"""
-        crane_usage = defaultdict(int)
-        for berth in self.berth_schedules.values():
-            for vessel in berth.vessels:
-                start = berth.start_times[vessel.vessel_id]
-                end = berth.end_times[vessel.vessel_id]
-                cranes = berth.crane_allocations[vessel.vessel_id]
-                for t in range(start, end):
-                    crane_usage[t] += cranes
-        return crane_usage
+    # v6.0: Compute realistic load penalty based on delay cost (much stronger)
+    avg_vessel_cost = 0
+    for v in sorted_vessels:
+        v_teu = v.get("handling_volume_teu", 1000)
+        avg_vessel_cost += v_teu * w_handle / 25
+    avg_vessel_cost = avg_vessel_cost / max(n_vessels, 1)
+    # v6.0: Much stronger load penalty (50% not 5%) to force berth spreading
+    load_penalty_factor = 0.50
 
+    for v in sorted_vessels:
+        v_id = v["id"]
+        v_len = v.get("length_m", 200)
+        v_draft = v.get("draft_m", 12.0)
+        v_teu = v.get("handling_volume_teu", 1000)
+        v_arrival = v.get("arrival_time", "2025-01-01T00:00:00Z")
+        v_deadline = v.get("max_departure_time", "2025-01-02T00:00:00Z")
+        v_priority = v.get("priority", 3)
+        v_name = v.get("name", f"Vessel-{v_id}")
 
-###############################################################################
-# GREEDY CONSTRUCTION HEURISTIC
-###############################################################################
-
-def greedy_construction(vessels, diversity_penalty=5, load_penalty=1):
-    """
-    Greedy construction with:
-    - Berth diversity constraint (soft penalty)
-    - Load balancing across berths
-    - Time-aware placement
-    """
-    solution = Solution()
-    remaining = sorted(vessels, key=lambda v: (v.priority != 'high', v.deadline))
-    
-    berth_load = {'A': 0, 'B': 0, 'C': 0}
-    avg_vessel_cost = sum(v.cost_factor for v in vessels) / len(vessels) if vessels else 1.0
-    
-    for vessel in remaining:
         best_berth = None
-        best_start_time = None
-        best_cranes = None
-        best_cost = float('inf')
-        
-        for berth_id, berth in solution.berth_schedules.items():
-            # Try to fit vessel in this berth
-            earliest_start = vessel.arrival_time
-            
-            for existing_vessel in berth.vessels:
-                existing_end = berth.end_times[existing_vessel.vessel_id]
-                if existing_end > earliest_start:
-                    earliest_start = max(earliest_start, existing_end)
-            
-            # Check crane feasibility
-            crane_usage = solution.calculate_crane_usage()
-            can_fit = True
-            for t in range(earliest_start, earliest_start + vessel.processing_time):
-                if crane_usage[t] + vessel.cranes_needed > MAX_CRANES:
-                    can_fit = False
-                    break
-            
-            if not can_fit:
+        best_cost = float("inf")          # v6.0: now stores PENALIZED cost for comparison
+        best_actual_cost = float("inf")   # v6.0: actual cost (without penalties) for assignment
+        best_start = None
+        best_cranes_assigned = min_cranes
+        best_handling_hours = 0
+        best_wait_hours = 0
+        best_delay_hours = 0
+        best_lookahead_score = float("inf")
+
+        for b in berths:
+            b_id = b["id"]
+            b_len = b.get("length_m", 300)
+            b_depth = b.get("depth_m", 15.0)
+            b_prod = b.get("productivity_teu_per_crane_hour", 25)
+
+            if v_len > b_len or v_draft > b_depth:
                 continue
-            
-            # Calculate cost with penalties
-            cost = vessel.processing_time * vessel.cranes_needed * vessel.cost_factor
-            
-            # Berth diversity penalty: discourage all vessels on cheapest berth
-            if berth_load[berth_id] > 0:
-                cost += diversity_penalty * avg_vessel_cost * 0.05
-            
-            # Load penalty: existing assignments increase cost
-            cost += load_penalty * avg_vessel_cost * 0.05 * len(berth.vessels)
-            
+
+            # v5.0: Skip berths at capacity unless no other option exists
+            if berth_vessel_count.get(b_id, 0) >= max_vessels_per_berth:
+                continue
+
+            berth_free = berth_end_times.get(b_id, v_arrival)
+            actual_start = max(v_arrival, berth_free)
+
+            for nc in range(min_cranes, max_cranes + 1):
+                handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+                end_time_h = _iso_to_hours(actual_start) + handling_hours
+                deadline_h = _iso_to_hours(v_deadline)
+
+                wait_hours = max(0, _iso_to_hours(actual_start) - _iso_to_hours(v_arrival))
+                delay_hours = max(0, end_time_h - deadline_h)
+                crane_cost = handling_hours * nc * w_handle
+                wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
+                delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
+
+                total_cost = crane_cost + wait_cost + delay_cost
+
+                # v6.0: Strong berth load penalty to force spreading across all berths
+                load_penalty = berth_vessel_count.get(b_id, 0) * load_penalty_factor * avg_vessel_cost
+                # v6.0: Extra penalty for queuing delay — estimate cascading delay impact
+                queue_penalty = 0
+                if berth_vessel_count.get(b_id, 0) > 0:
+                    # Estimate how much queuing at this berth delays future vessels
+                    queue_penalty = handling_hours * w_delay * 0.3  # 30% of delay cost of our handling time
+                penalized_cost = total_cost + load_penalty + queue_penalty
+
+                # v5.0: Look-ahead scoring
+                lookahead_score = _compute_lookahead_score(
+                    actual_start, handling_hours, b_id, sorted_vessels, v_id, berth_end_times
+                )
+
+                # v6.0 FIX: Compare penalized vs penalized (was comparing penalized vs actual — penalties had no effect!)
+                if penalized_cost < best_cost or (penalized_cost == best_cost and lookahead_score < best_lookahead_score):
+                    best_cost = penalized_cost      # v6.0: store PENALIZED cost for correct comparison
+                    best_actual_cost = total_cost   # v6.0: actual cost for the assignment record
+                    best_berth = b_id
+                    best_start = actual_start
+                    best_cranes_assigned = nc
+                    best_handling_hours = handling_hours
+                    best_wait_hours = wait_hours
+                    best_delay_hours = delay_hours
+                    best_lookahead_score = lookahead_score
+
+        if best_berth is not None:
+            end_time_str = _hours_to_iso(
+                _iso_to_hours(best_start) + best_handling_hours,
+                best_start
+            )
+            berth_end_times[best_berth] = end_time_str
+            berth_vessel_count[best_berth] += 1  # v5.0: increment vessel count
+
+            assignments.append({
+                "vessel_id": v_id,
+                "vessel_name": v_name,
+                "berth_id": best_berth,
+                "start_time": best_start,
+                "end_time": end_time_str,
+                "cranes_assigned": best_cranes_assigned,
+                "handling_hours": round(best_handling_hours, 2),
+                "waiting_hours": round(best_wait_hours, 2),
+                "delay_hours": round(best_delay_hours, 2),
+                "cost": round(best_actual_cost, 2),  # v6.0: use actual cost, not penalized
+                "priority": v_priority,
+                "teu_volume": v_teu
+            })
+        else:
+            # If no berth available, try without capacity constraint
+            for b in berths:
+                b_id = b["id"]
+                b_len = b.get("length_m", 300)
+                b_depth = b.get("depth_m", 15.0)
+                b_prod = b.get("productivity_teu_per_crane_hour", 25)
+
+                if v_len > b_len or v_draft > b_depth:
+                    continue
+
+                berth_free = berth_end_times.get(b_id, v_arrival)
+                actual_start = max(v_arrival, berth_free)
+
+                for nc in range(min_cranes, max_cranes + 1):
+                    handling_hours = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+                    end_time_h = _iso_to_hours(actual_start) + handling_hours
+                    deadline_h = _iso_to_hours(v_deadline)
+
+                    wait_hours = max(0, _iso_to_hours(actual_start) - _iso_to_hours(v_arrival))
+                    delay_hours = max(0, end_time_h - deadline_h)
+                    crane_cost = handling_hours * nc * w_handle
+                    wait_cost = wait_hours * w_wait * (w_priority if v_priority <= 2 else 1.0)
+                    delay_cost = delay_hours * w_delay * (w_priority if v_priority <= 2 else 1.0)
+
+                    total_cost = crane_cost + wait_cost + delay_cost
+
+                    if total_cost < best_cost:
+                        best_cost = total_cost
+                        best_actual_cost = total_cost
+                        best_berth = b_id
+                        best_start = actual_start
+                        best_cranes_assigned = nc
+                        best_handling_hours = handling_hours
+                        best_wait_hours = wait_hours
+                        best_delay_hours = delay_hours
+
+            if best_berth is not None:
+                end_time_str = _hours_to_iso(
+                    _iso_to_hours(best_start) + best_handling_hours,
+                    best_start
+                )
+                berth_end_times[best_berth] = end_time_str
+                berth_vessel_count[best_berth] += 1
+
+                assignments.append({
+                    "vessel_id": v_id,
+                    "vessel_name": v_name,
+                    "berth_id": best_berth,
+                    "start_time": best_start,
+                    "end_time": end_time_str,
+                    "cranes_assigned": best_cranes_assigned,
+                    "handling_hours": round(best_handling_hours, 2),
+                    "waiting_hours": round(best_wait_hours, 2),
+                    "delay_hours": round(best_delay_hours, 2),
+                    "cost": round(best_cost, 2),
+                    "priority": v_priority,
+                    "teu_volume": v_teu
+                })
+            else:
+                assignments.append({
+                    "vessel_id": v_id,
+                    "vessel_name": v_name,
+                    "berth_id": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "cranes_assigned": 0,
+                    "handling_hours": 0,
+                    "cost": 0,
+                    "status": "infeasible"
+                })
+                logger.warning(f"Vessel {v_id}: no feasible berth found!")
+
+    greedy_cost = sum(a["cost"] for a in assignments)
+    cost_evolution.append({"iteration": 0, "phase": "greedy", "objective_value": round(greedy_cost, 2)})
+    logger.info(f"Greedy phase complete: cost={greedy_cost:.2f}")
+
+    # ── 2b. EARLY crane budget enforcement + resequencing (v6.0) ─────
+    # Apply crane budget BEFORE local search so 2-opt/or-opt see realistic costs
+    logger.info("Early crane budget enforcement (before local search)...")
+    assignments, early_cb_changes = _enforce_crane_budget(
+        assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights
+    )
+    if early_cb_changes > 0:
+        logger.info(f"Early crane budget adjusted {early_cb_changes} assignments")
+    assignments, early_rs_changes = _resequence_all_berths(
+        assignments, vessels, berths, cost_weights, w_priority
+    )
+    if early_rs_changes > 0:
+        logger.info(f"Early resequencing updated {early_rs_changes} assignments")
+    post_early_cost = sum(a["cost"] for a in assignments)
+    cost_evolution.append({"iteration": 0.5, "phase": "early_crane_budget", "objective_value": round(post_early_cost, 2)})
+    logger.info(f"Post-early-enforcement cost: {post_early_cost:.2f}")
+
+    # ── 3. 2-opt local search improvement ─────────────────────────────
+    max_iterations = solver_params.get("max_2opt_iterations", 50)
+    improved = True
+    iteration = 0
+    while improved and iteration < max_iterations:
+        improved = False
+        iteration += 1
+        for i in range(len(assignments)):
+            for j in range(i + 1, len(assignments)):
+                a1, a2 = assignments[i], assignments[j]
+                if a1.get("berth_id") is None or a2.get("berth_id") is None:
+                    continue
+                old_cost = a1["cost"] + a2["cost"]
+                new_a1, new_a2 = _try_swap(a1, a2, berths, vessels, cost_weights, cranes_cfg)
+                if new_a1 is not None:
+                    new_cost = new_a1["cost"] + new_a2["cost"]
+                    if new_cost < old_cost * 0.99:
+                        assignments[i] = new_a1
+                        assignments[j] = new_a2
+                        improved = True
+
+        current_cost = sum(a["cost"] for a in assignments)
+        cost_evolution.append({
+            "iteration": iteration,
+            "phase": "2-opt",
+            "objective_value": round(current_cost, 2)
+        })
+
+    two_opt_cost = sum(a["cost"] for a in assignments)
+    logger.info(f"2-opt completed after {iteration} iterations: cost={two_opt_cost:.2f}")
+
+    # ── 3b. Or-opt moves: relocate single vessels ─────────────────────
+    oropt_improved = 0
+    for idx, a in enumerate(assignments):
+        if a.get("berth_id") is None:
+            continue
+        v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+        if not v_data:
+            continue
+
+        old_cost = a["cost"]
+        best_cost = old_cost
+        best_config = None
+
+        # Try moving this vessel to each alternative berth
+        for b in berths:
+            b_id = b["id"]
+            if b_id == a.get("berth_id"):
+                continue  # Skip current berth
+
+            v_len = v_data.get("length_m", 200)
+            v_draft = v_data.get("draft_m", 12.0)
+            b_len = b.get("length_m", 300)
+            b_depth = b.get("depth_m", 15.0)
+
+            if v_len > b_len or v_draft > b_depth:
+                continue
+
+            # v5.0: Check berth capacity for or-opt moves
+            vessel_count_at_berth = sum(1 for x in assignments if x.get("berth_id") == b_id and x.get("berth_id") is not None)
+            if vessel_count_at_berth >= max_vessels_per_berth:
+                continue
+
+            for nc in range(min_cranes, max_cranes + 1):
+                config = _evaluate_vessel_at_berth(v_data, b, a["start_time"], nc, cost_weights)
+                if config is not None:
+                    # v6.0: Add load penalty to or-opt to prevent undoing greedy spreading
+                    oropt_load_penalty = vessel_count_at_berth * load_penalty_factor * avg_vessel_cost
+                    oropt_penalized = config["cost"] + oropt_load_penalty
+                    if oropt_penalized < best_cost:
+                        best_cost = oropt_penalized
+                        best_config = {"berth": b_id, "config": config, "cranes": nc}
+
+        # v6.0: Also apply penalty to current berth for fair comparison
+        current_berth_count = sum(1 for x in assignments if x.get("berth_id") == a.get("berth_id") and x.get("berth_id") is not None) - 1
+        old_penalized_cost = old_cost + current_berth_count * load_penalty_factor * avg_vessel_cost
+        if best_config is not None and best_cost < old_penalized_cost * 0.99:
+            assignments[idx]["berth_id"] = best_config["berth"]
+            assignments[idx]["cost"] = best_config["config"]["cost"]
+            assignments[idx]["handling_hours"] = best_config["config"]["handling_hours"]
+            assignments[idx]["cranes_assigned"] = best_config["cranes"]
+            assignments[idx]["waiting_hours"] = best_config["config"]["waiting_hours"]
+            assignments[idx]["delay_hours"] = best_config["config"]["delay_hours"]
+            assignments[idx]["end_time"] = best_config["config"]["end_time"]
+            oropt_improved += 1
+
+    current_cost = sum(a["cost"] for a in assignments)
+    if oropt_improved > 0:
+        cost_evolution.append({
+            "iteration": iteration + 1,
+            "phase": "or-opt",
+            "objective_value": round(current_cost, 2)
+        })
+        logger.info(f"Or-opt moved {oropt_improved} vessels: cost={current_cost:.2f}")
+
+    # ── 3c. 3-opt moves: rotate 3 vessels among 3 berths (v5.0 new) ────
+    threeopt_improved = 0
+    max_3opt_iterations = 30
+    for iteration_3opt in range(max_3opt_iterations):
+        improved_3opt = False
+        # Iterate through all triples of feasible assignments
+        feasible_indices = [i for i, a in enumerate(assignments) if a.get("berth_id") is not None]
+        if len(feasible_indices) < 3:
+            break
+
+        for i, j, k in itertools.combinations(feasible_indices, 3):
+            a1, a2, a3 = assignments[i], assignments[j], assignments[k]
+            old_cost = a1["cost"] + a2["cost"] + a3["cost"]
+
+            # Try rotating berth assignments: a1→b2, a2→b3, a3→b1
+            b1_id, b2_id, b3_id = a1["berth_id"], a2["berth_id"], a3["berth_id"]
+            if b1_id == b2_id or b2_id == b3_id or b1_id == b3_id:
+                continue
+
+            v1 = next((v for v in vessels if v["id"] == a1["vessel_id"]), None)
+            v2 = next((v for v in vessels if v["id"] == a2["vessel_id"]), None)
+            v3 = next((v for v in vessels if v["id"] == a3["vessel_id"]), None)
+            b2 = next((b for b in berths if b["id"] == b2_id), None)
+            b3 = next((b for b in berths if b["id"] == b3_id), None)
+            b1 = next((b for b in berths if b["id"] == b1_id), None)
+
+            if not all([v1, v2, v3, b1, b2, b3]):
+                continue
+
+            # Check feasibility of rotation
+            if v1.get("length_m", 200) > b2.get("length_m", 300) or v1.get("draft_m", 12) > b2.get("depth_m", 15):
+                continue
+            if v2.get("length_m", 200) > b3.get("length_m", 300) or v2.get("draft_m", 12) > b3.get("depth_m", 15):
+                continue
+            if v3.get("length_m", 200) > b1.get("length_m", 300) or v3.get("draft_m", 12) > b1.get("depth_m", 15):
+                continue
+
+            # Evaluate rotated configuration
+            config1 = _evaluate_vessel_at_berth(v1, b2, a1["start_time"], a1["cranes_assigned"], cost_weights)
+            config2 = _evaluate_vessel_at_berth(v2, b3, a2["start_time"], a2["cranes_assigned"], cost_weights)
+            config3 = _evaluate_vessel_at_berth(v3, b1, a3["start_time"], a3["cranes_assigned"], cost_weights)
+
+            if config1 and config2 and config3:
+                new_cost = config1["cost"] + config2["cost"] + config3["cost"]
+                if new_cost < old_cost * 0.99:
+                    # Apply rotation
+                    assignments[i]["berth_id"] = b2_id
+                    assignments[i].update(config1)
+                    assignments[j]["berth_id"] = b3_id
+                    assignments[j].update(config2)
+                    assignments[k]["berth_id"] = b1_id
+                    assignments[k].update(config3)
+                    improved_3opt = True
+                    threeopt_improved += 1
+
+        if not improved_3opt:
+            break
+
+    current_cost = sum(a["cost"] for a in assignments)
+    if threeopt_improved > 0:
+        cost_evolution.append({
+            "iteration": iteration + 2,
+            "phase": "3-opt",
+            "objective_value": round(current_cost, 2)
+        })
+        logger.info(f"3-opt improved {threeopt_improved} configurations: cost={current_cost:.2f}")
+
+    # ── 3d. Crane re-balancing pass ──────────────────────────────────
+    crane_opt_improved = 0
+    for idx, a in enumerate(assignments):
+        if a.get("berth_id") is None:
+            continue
+        v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+        b_data = next((b for b in berths if b["id"] == a["berth_id"]), None)
+        if not v_data or not b_data:
+            continue
+
+        v_teu = v_data.get("handling_volume_teu", 1000)
+        v_priority = v_data.get("priority", 3)
+        pm = w_priority if v_priority <= 2 else 1.0
+        b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
+
+        best_nc = a["cranes_assigned"]
+        best_cost = a["cost"]
+
+        for nc in range(min_cranes, max_cranes + 1):
+            handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+            end_h = _iso_to_hours(a["start_time"]) + handling_h
+            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+            arr_h = _iso_to_hours(v_data.get("arrival_time", a["start_time"]))
+            wait_h = max(0, _iso_to_hours(a["start_time"]) - arr_h)
+            delay_h = max(0, end_h - deadline_h)
+
+            cost = (handling_h * nc * w_handle +
+                    wait_h * w_wait * pm +
+                    delay_h * w_delay * pm)
+
             if cost < best_cost:
                 best_cost = cost
-                best_berth = berth_id
-                best_start_time = earliest_start
-                best_cranes = vessel.cranes_needed
-        
-        if best_berth:
-            solution.assign_vessel(vessel, best_berth, best_start_time, best_cranes)
-            berth_load[best_berth] += 1
-        else:
-            solution.unscheduled_vessels.append(vessel)
-    
-    solution.total_cost = solution.calculate_total_cost()
-    return solution
+                best_nc = nc
 
+        if best_nc != a["cranes_assigned"]:
+            handling_h = v_teu / (b_prod * best_nc) if b_prod * best_nc > 0 else 999
+            end_h = _iso_to_hours(a["start_time"]) + handling_h
+            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+            delay_h = max(0, end_h - deadline_h)
+            wait_h = a.get("waiting_hours", 0)
 
-###############################################################################
-# LOCAL SEARCH IMPROVEMENTS: 2-OPT, OR-OPT, 3-OPT
-###############################################################################
+            assignments[idx] = dict(a)
+            assignments[idx]["cranes_assigned"] = best_nc
+            assignments[idx]["handling_hours"] = round(handling_h, 2)
+            assignments[idx]["delay_hours"] = round(delay_h, 2)
+            assignments[idx]["cost"] = round(best_cost, 2)
+            assignments[idx]["end_time"] = _hours_to_iso(end_h, a["start_time"])
+            crane_opt_improved += 1
 
-def two_opt(solution):
-    """
-    2-opt: swap pair of vessels to reduce cost
-    Try all pairs of vessels within and across berths
-    """
-    improved = True
-    iteration = 0
-    
-    while improved and iteration < MAX_2OPT_ITERATIONS:
-        improved = False
-        iteration += 1
-        
-        # Collect all scheduled vessels
-        all_vessels = []
-        for berth_id, berth in solution.berth_schedules.items():
-            for vessel in berth.vessels:
-                all_vessels.append((berth_id, vessel))
-        
-        # Try swaps
-        for i, (berth_i, vessel_i) in enumerate(all_vessels):
-            for j, (berth_j, vessel_j) in enumerate(all_vessels):
-                if i >= j:
-                    continue
-                
-                # Swap vessels
-                solution.unassign_vessel(vessel_i.vessel_id, berth_i)
-                solution.unassign_vessel(vessel_j.vessel_id, berth_j)
-                
-                # Reassign swapped
-                start_i_before = solution.berth_schedules[berth_i].start_times.get(vessel_i.vessel_id, vessel_i.arrival_time)
-                start_j_before = solution.berth_schedules[berth_j].start_times.get(vessel_j.vessel_id, vessel_j.arrival_time)
-                
-                try:
-                    solution.assign_vessel(vessel_i, berth_j, start_j_before, vessel_i.cranes_needed)
-                    solution.assign_vessel(vessel_j, berth_i, start_i_before, vessel_j.cranes_needed)
-                    
-                    new_cost = solution.calculate_total_cost()
-                    if new_cost < solution.total_cost and solution.is_feasible():
-                        solution.total_cost = new_cost
-                        improved = True
-                        solution.convergence_history.append(new_cost)
-                    else:
-                        # Revert
-                        solution.unassign_vessel(vessel_i.vessel_id, berth_j)
-                        solution.unassign_vessel(vessel_j.vessel_id, berth_i)
-                        solution.assign_vessel(vessel_i, berth_i, start_i_before, vessel_i.cranes_needed)
-                        solution.assign_vessel(vessel_j, berth_j, start_j_before, vessel_j.cranes_needed)
-                except:
-                    # Revert on error
-                    solution.unassign_vessel(vessel_i.vessel_id, berth_j) if vessel_i.vessel_id in solution.berth_schedules[berth_j].start_times else None
-                    solution.unassign_vessel(vessel_j.vessel_id, berth_i) if vessel_j.vessel_id in solution.berth_schedules[berth_i].start_times else None
-                    solution.assign_vessel(vessel_i, berth_i, start_i_before, vessel_i.cranes_needed)
-                    solution.assign_vessel(vessel_j, berth_j, start_j_before, vessel_j.cranes_needed)
-    
-    return solution
+    final_cost_after_crane_opt = sum(a["cost"] for a in assignments)
+    if crane_opt_improved > 0:
+        cost_evolution.append({
+            "iteration": iteration + 3,
+            "phase": "crane_reopt",
+            "objective_value": round(final_cost_after_crane_opt, 2)
+        })
+        logger.info(f"Crane re-balancing improved {crane_opt_improved} assignments: "
+                     f"cost={final_cost_after_crane_opt:.2f}")
 
-
-def or_opt(solution):
-    """
-    Or-opt: relocate single vessel to different berth
-    Explores neighborhood better than 2-opt alone
-    """
-    improved = True
-    iteration = 0
-    
-    while improved and iteration < MAX_OROPT_ITERATIONS:
-        improved = False
-        iteration += 1
-        
-        for berth_id, berth in solution.berth_schedules.items():
-            if not berth.vessels:
-                continue
-            
-            for vessel in list(berth.vessels):
-                original_start = berth.start_times[vessel.vessel_id]
-                original_cranes = berth.crane_allocations[vessel.vessel_id]
-                original_cost = solution.total_cost
-                
-                # Try moving to each other berth
-                for target_berth_id in solution.berth_schedules.keys():
-                    if target_berth_id == berth_id:
-                        continue
-                    
-                    target_berth = solution.berth_schedules[target_berth_id]
-                    
-                    # Find earliest time in target berth
-                    earliest_start = vessel.arrival_time
-                    for other_vessel in target_berth.vessels:
-                        existing_end = target_berth.end_times[other_vessel.vessel_id]
-                        if existing_end > earliest_start:
-                            earliest_start = max(earliest_start, existing_end)
-                    
-                    # Remove from original
-                    solution.unassign_vessel(vessel.vessel_id, berth_id)
-                    
-                    # Try to add to target
-                    try:
-                        solution.assign_vessel(vessel, target_berth_id, earliest_start, original_cranes)
-                        
-                        new_cost = solution.calculate_total_cost()
-                        if new_cost < original_cost and solution.is_feasible():
-                            solution.total_cost = new_cost
-                            improved = True
-                            solution.convergence_history.append(new_cost)
-                        else:
-                            # Revert
-                            solution.unassign_vessel(vessel.vessel_id, target_berth_id)
-                            solution.assign_vessel(vessel, berth_id, original_start, original_cranes)
-                    except:
-                        # Revert on error
-                        if vessel.vessel_id not in berth.start_times:
-                            solution.unassign_vessel(vessel.vessel_id, target_berth_id) if vessel.vessel_id in solution.berth_schedules[target_berth_id].start_times else None
-                            solution.assign_vessel(vessel, berth_id, original_start, original_cranes)
-    
-    return solution
-
-
-def three_opt(solution):
-    """
-    3-opt: rotate 3 vessels among 3 berths for additional improvements
-    """
-    improved = True
-    iteration = 0
-    
-    while improved and iteration < MAX_3OPT_ITERATIONS:
-        improved = False
-        iteration += 1
-        
-        berth_ids = list(solution.berth_schedules.keys())
-        if len(berth_ids) < 3:
-            break
-        
-        # Get vessels from first 3 berths
-        vessels_by_berth = {bid: [] for bid in berth_ids}
-        for bid in berth_ids:
-            vessels_by_berth[bid] = list(solution.berth_schedules[bid].vessels)
-        
-        # Try 3-way rotations
-        for b1_idx, b2_idx, b3_idx in [(0, 1, 2), (0, 2, 1), (1, 2, 0)]:
-            b1, b2, b3 = berth_ids[b1_idx], berth_ids[b2_idx], berth_ids[b3_idx]
-            
-            if not vessels_by_berth[b1] or not vessels_by_berth[b2] or not vessels_by_berth[b3]:
-                continue
-            
-            v1 = vessels_by_berth[b1][0]
-            v2 = vessels_by_berth[b2][0]
-            v3 = vessels_by_berth[b3][0]
-            
-            original_cost = solution.total_cost
-            
-            try:
-                # Store originals
-                start_v1, start_v2, start_v3 = (solution.berth_schedules[b1].start_times[v1.vessel_id],
-                                               solution.berth_schedules[b2].start_times[v2.vessel_id],
-                                               solution.berth_schedules[b3].start_times[v3.vessel_id])
-                
-                # Remove all three
-                solution.unassign_vessel(v1.vessel_id, b1)
-                solution.unassign_vessel(v2.vessel_id, b2)
-                solution.unassign_vessel(v3.vessel_id, b3)
-                
-                # Rotate: v1 -> b2, v2 -> b3, v3 -> b1
-                solution.assign_vessel(v1, b2, start_v2, v1.cranes_needed)
-                solution.assign_vessel(v2, b3, start_v3, v2.cranes_needed)
-                solution.assign_vessel(v3, b1, start_v1, v3.cranes_needed)
-                
-                new_cost = solution.calculate_total_cost()
-                if new_cost < original_cost and solution.is_feasible():
-                    solution.total_cost = new_cost
-                    improved = True
-                    solution.convergence_history.append(new_cost)
-                else:
-                    # Revert
-                    solution.unassign_vessel(v1.vessel_id, b2)
-                    solution.unassign_vessel(v2.vessel_id, b3)
-                    solution.unassign_vessel(v3.vessel_id, b1)
-                    solution.assign_vessel(v1, b1, start_v1, v1.cranes_needed)
-                    solution.assign_vessel(v2, b2, start_v2, v2.cranes_needed)
-                    solution.assign_vessel(v3, b3, start_v3, v3.cranes_needed)
-            except:
-                pass
-    
-    return solution
-
-
-###############################################################################
-# CRANE REBALANCING
-###############################################################################
-
-def rebalance_cranes(solution):
-    """
-    Rebalance crane allocation across fleet
-    Find better distributions that respect global budget
-    """
-    crane_usage = solution.calculate_crane_usage()
-    max_usage = max(crane_usage.values()) if crane_usage else 0
-    
-    if max_usage <= MAX_CRANES:
-        return solution  # Already feasible
-    
-    # Try reducing crane allocation per vessel
-    for berth in solution.berth_schedules.values():
-        for vessel in berth.vessels:
-            current_cranes = berth.crane_allocations[vessel.vessel_id]
-            if current_cranes > 1:
-                # Try reducing
-                berth.crane_allocations[vessel.vessel_id] = max(1, current_cranes - 1)
-                
-                crane_usage = solution.calculate_crane_usage()
-                if max(crane_usage.values()) > MAX_CRANES:
-                    # Revert if infeasible
-                    berth.crane_allocations[vessel.vessel_id] = current_cranes
-    
-    solution.total_cost = solution.calculate_total_cost()
-    return solution
-
-
-###############################################################################
-# MAIN OPTIMIZATION FUNCTION
-###############################################################################
-
-def optimize(vessels, output_dir='additional_output'):
-    """
-    Main optimization pipeline:
-    1. Greedy construction with diversity & load balancing
-    2. Crane rebalancing
-    3. 2-opt local search
-    4. Or-opt improvements
-    5. 3-opt fine-tuning
-    6. Generate expert dashboard
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    random.seed(RANDOM_SEED)
-    
-    print("\n" + "="*80)
-    print("BAP+QCA SOLVER v6.0")
-    print("="*80)
-    
-    start_time = time.time()
-    
-    # Phase 1: Greedy Construction
-    print("\n[PHASE 1] Greedy Construction with Diversity & Load Balancing...")
-    phase_1_start = time.time()
-    solution = greedy_construction(vessels, diversity_penalty=5, load_penalty=1)
-    phase_1_time = time.time() - phase_1_start
-    print(f"  Greedy cost: {solution.total_cost:.2f}")
-    print(f"  Scheduled: {sum(len(b.vessels) for b in solution.berth_schedules.values())}/{len(vessels)}")
-    print(f"  Time: {phase_1_time:.2f}s")
-    solution.phase_markers.append(('Greedy Construction', solution.total_cost, phase_1_time))
-    
-    # Phase 2: Crane Rebalancing
-    print("\n[PHASE 2] Crane Rebalancing...")
-    phase_2_start = time.time()
-    solution = rebalance_cranes(solution)
-    phase_2_time = time.time() - phase_2_start
-    print(f"  Rebalanced cost: {solution.total_cost:.2f}")
-    print(f"  Time: {phase_2_time:.2f}s")
-    solution.phase_markers.append(('Crane Rebalancing', solution.total_cost, phase_2_time))
-    
-    # Phase 3: 2-opt
-    print("\n[PHASE 3] 2-opt Local Search...")
-    phase_3_start = time.time()
-    solution = two_opt(solution)
-    phase_3_time = time.time() - phase_3_start
-    print(f"  2-opt cost: {solution.total_cost:.2f}")
-    print(f"  Time: {phase_3_time:.2f}s")
-    solution.phase_markers.append(('2-opt Local Search', solution.total_cost, phase_3_time))
-    
-    # Phase 4: Or-opt
-    print("\n[PHASE 4] Or-opt Improvement...")
-    phase_4_start = time.time()
-    solution = or_opt(solution)
-    phase_4_time = time.time() - phase_4_start
-    print(f"  Or-opt cost: {solution.total_cost:.2f}")
-    print(f"  Time: {phase_4_time:.2f}s")
-    solution.phase_markers.append(('Or-opt Improvement', solution.total_cost, phase_4_time))
-    
-    # Phase 5: 3-opt
-    print("\n[PHASE 5] 3-opt Fine-tuning...")
-    phase_5_start = time.time()
-    solution = three_opt(solution)
-    phase_5_time = time.time() - phase_5_start
-    print(f"  3-opt cost: {solution.total_cost:.2f}")
-    print(f"  Time: {phase_5_time:.2f}s")
-    solution.phase_markers.append(('3-opt Fine-tuning', solution.total_cost, phase_5_time))
-    
-    total_time = time.time() - start_time
-    
-    print("\n" + "="*80)
-    print("OPTIMIZATION COMPLETE")
-    print("="*80)
-    print(f"Total cost: {solution.total_cost:.2f}")
-    print(f"Total time: {total_time:.2f}s")
-    
-    # Phase 6: Generate expert dashboard
-    print("\n[PHASE 6] Generating Expert Dashboard...")
-    generate_expert_dashboard(solution, output_dir)
-    print(f"  Dashboard saved to {output_dir}/01_expert_dashboard.html")
-    
-    return solution
-
-
-###############################################################################
-# DASHBOARD GENERATION
-###############################################################################
-
-def generate_expert_dashboard(solution, output_dir):
-    """
-    Generate comprehensive expert dashboard with 6 interactive tabs
-    """
-    # Collect data
-    total_cost = solution.total_cost
-    num_scheduled = sum(len(b.vessels) for b in solution.berth_schedules.values())
-    num_unscheduled = len(solution.unscheduled_vessels)
-    berth_loads = {bid: len(b.vessels) for bid, b in solution.berth_schedules.items()}
-    crane_usage = solution.calculate_crane_usage()
-    
-    # Prepare chart data
-    phase_names = [p[0] for p in solution.phase_markers]
-    phase_costs = [p[1] for p in solution.phase_markers]
-    phase_times = [p[2] for p in solution.phase_markers]
-    
-    convergence_data = solution.convergence_history if solution.convergence_history else [solution.total_cost]
-    
-    # Generate Gantt data
-    gantt_traces = []
-    colors = {'A': 'rgb(31, 119, 180)', 'B': 'rgb(255, 127, 14)', 'C': 'rgb(44, 160, 44)'}
-    for berth_id, berth in solution.berth_schedules.items():
-        for vessel in berth.vessels:
-            start = berth.start_times[vessel.vessel_id]
-            duration = vessel.processing_time
-            gantt_traces.append({
-                'x': [start, start + duration],
-                'y': [berth_id, berth_id],
-                'vessel': vessel.vessel_id,
-                'color': colors[berth_id]
-            })
-    
-    # Build HTML
-    html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>QCentroid Expert Dashboard v6.0</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #0a192f;
-            color: #e0e0e0;
-            line-height: 1.6;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .header {
-            background: linear-gradient(135deg, #0a192f 0%, #1a3a52 100%);
-            padding: 30px;
-            border-radius: 8px;
-            margin-bottom: 30px;
-            border-left: 4px solid #64ffda;
-        }
-        .header h1 {
-            color: #64ffda;
-            font-size: 32px;
-            margin-bottom: 10px;
-        }
-        .header p {
-            color: #b0bfc7;
-            font-size: 14px;
-        }
-        .tabs {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 30px;
-            border-bottom: 2px solid #2c74b3;
-            flex-wrap: wrap;
-        }
-        .tab-button {
-            padding: 12px 24px;
-            background: #1a3a52;
-            color: #64ffda;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            border-bottom: 3px solid transparent;
-            transition: all 0.3s;
-        }
-        .tab-button.active {
-            background: #2c74b3;
-            border-bottom-color: #64ffda;
-        }
-        .tab-button:hover {
-            background: #2c74b3;
-        }
-        .tab-content {
-            display: none;
-            animation: fadeIn 0.3s;
-        }
-        .tab-content.active {
-            display: block;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-        .kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .kpi-card {
-            background: #1a3a52;
-            padding: 20px;
-            border-radius: 8px;
-            border-left: 4px solid #2c74b3;
-        }
-        .kpi-label {
-            color: #b0bfc7;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .kpi-value {
-            color: #64ffda;
-            font-size: 28px;
-            font-weight: bold;
-            margin-top: 8px;
-        }
-        .chart-container {
-            background: #1a3a52;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 30px;
-            border: 1px solid #2c74b3;
-        }
-        .chart-title {
-            color: #64ffda;
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 20px;
-        }
-        .metric-table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #1a3a52;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-        .metric-table th {
-            background: #2c74b3;
-            padding: 12px;
-            text-align: left;
-            color: #64ffda;
-            font-weight: 600;
-        }
-        .metric-table td {
-            padding: 12px;
-            border-bottom: 1px solid #2c74b3;
-            color: #e0e0e0;
-        }
-        .metric-table tr:hover {
-            background: #0f2a42;
-        }
-        .footer {
-            margin-top: 40px;
-            padding: 20px;
-            text-align: center;
-            color: #b0bfc7;
-            font-size: 12px;
-            border-top: 1px solid #2c74b3;
-        }
-        svg {
-            max-width: 100%;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>QCentroid Expert Dashboard</h1>
-            <p>Classical BAP+QCA Solver v6.0 | Berth Allocation & Quay Crane Assignment</p>
-        </div>
-        
-        <div class="tabs">
-            <button class="tab-button active" onclick="switchTab('overview')">Port Overview</button>
-            <button class="tab-button" onclick="switchTab('gantt')">Gantt Timeline</button>
-            <button class="tab-button" onclick="switchTab('costs')">Cost Intelligence</button>
-            <button class="tab-button" onclick="switchTab('convergence')">Optimization Convergence</button>
-            <button class="tab-button" onclick="switchTab('berth')">Berth Analytics</button>
-            <button class="tab-button" onclick="switchTab('summary')">Performance Summary</button>
-        </div>
-        
-        <!-- TAB 1: Port Overview -->
-        <div id="overview" class="tab-content active">
-            <div class="kpi-grid">
-                <div class="kpi-card">
-                    <div class="kpi-label">Total Cost</div>
-                    <div class="kpi-value">""" + f"${total_cost:.0f}" + """</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-label">Vessels Scheduled</div>
-                    <div class="kpi-value">""" + str(num_scheduled) + """</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-label">Unscheduled</div>
-                    <div class="kpi-value">""" + str(num_unscheduled) + """</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-label">Utilization</div>
-                    <div class="kpi-value">""" + f"{(num_scheduled/(num_scheduled+num_unscheduled)*100):.0f}%" + """</div>
-                </div>
-            </div>
-            <div class="chart-container">
-                <div class="chart-title">Berth Vessel Distribution</div>
-                <div id="berth-pie-chart"></div>
-            </div>
-        </div>
-        
-        <!-- TAB 2: Gantt Timeline -->
-        <div id="gantt" class="tab-content">
-            <div class="chart-container">
-                <div class="chart-title">Vessel Scheduling Timeline</div>
-                <div id="gantt-chart"></div>
-            </div>
-        </div>
-        
-        <!-- TAB 3: Cost Intelligence -->
-        <div id="costs" class="tab-content">
-            <div class="kpi-grid">
-                <div class="kpi-card">
-                    <div class="kpi-label">Total Cost</div>
-                    <div class="kpi-value">""" + f"${total_cost:.0f}" + """</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-label">Avg Cost / Vessel</div>
-                    <div class="kpi-value">""" + f"${total_cost/num_scheduled:.0f}" if num_scheduled > 0 else "$0" + """</div>
-                </div>
-            </div>
-            <div class="chart-container">
-                <div class="chart-title">Cost Breakdown by Berth</div>
-                <div id="cost-chart"></div>
-            </div>
-        </div>
-        
-        <!-- TAB 4: Optimization Convergence -->
-        <div id="convergence" class="tab-content">
-            <div class="chart-container">
-                <div class="chart-title">Convergence History with Phase Markers</div>
-                <div id="convergence-chart"></div>
-            </div>
-            <div class="chart-container">
-                <div class="chart-title">Phase Timing Analysis</div>
-                <div id="phase-table"></div>
-            </div>
-        </div>
-        
-        <!-- TAB 5: Berth Analytics -->
-        <div id="berth" class="tab-content">
-            <div class="chart-container">
-                <div class="chart-title">Berth Utilization & Load Heatmap</div>
-                <div id="berth-heatmap"></div>
-            </div>
-        </div>
-        
-        <!-- TAB 6: Performance Summary -->
-        <div id="summary" class="tab-content">
-            <div class="chart-container">
-                <div class="chart-title">Key Metrics</div>
-                <table class="metric-table">
-                    <thead>
-                        <tr>
-                            <th>Metric</th>
-                            <th>Value</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td>Total Cost</td>
-                            <td>""" + f"${total_cost:.2f}" + """</td>
-                        </tr>
-                        <tr>
-                            <td>Vessels Scheduled</td>
-                            <td>""" + str(num_scheduled) + """</td>
-                        </tr>
-                        <tr>
-                            <td>Scheduling Rate</td>
-                            <td>""" + f"{(num_scheduled/(num_scheduled+num_unscheduled)*100):.1f}%" if (num_scheduled+num_unscheduled) > 0 else "0%" + """</td>
-                        </tr>
-                        <tr>
-                            <td>Berth A Load</td>
-                            <td>""" + str(berth_loads['A']) + """ vessels</td>
-                        </tr>
-                        <tr>
-                            <td>Berth B Load</td>
-                            <td>""" + str(berth_loads['B']) + """ vessels</td>
-                        </tr>
-                        <tr>
-                            <td>Berth C Load</td>
-                            <td>""" + str(berth_loads['C']) + """ vessels</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        
-        <div class="footer">
-            Generated by QCentroid v6.0 | """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """
-        </div>
-    </div>
-    
-    <script>
-        function switchTab(tabName) {
-            // Hide all tabs
-            const tabs = document.querySelectorAll('.tab-content');
-            tabs.forEach(t => t.classList.remove('active'));
-            
-            // Remove active from all buttons
-            const buttons = document.querySelectorAll('.tab-button');
-            buttons.forEach(b => b.classList.remove('active'));
-            
-            // Show selected tab
-            document.getElementById(tabName).classList.add('active');
-            
-            // Mark button as active
-            event.target.classList.add('active');
-        }
-        
-        // Berth distribution pie chart
-        const berth_data = [{
-            x: ['Berth A', 'Berth B', 'Berth C'],
-            y: [""" + str(berth_loads['A']) + """, """ + str(berth_loads['B']) + """, """ + str(berth_loads['C']) + """],
-            type: 'pie',
-            marker: { colors: ['rgb(31, 119, 180)', 'rgb(255, 127, 14)', 'rgb(44, 160, 44)'] }
-        }];
-        
-        const berth_layout = {
-            title: '',
-            paper_bgcolor: '#1a3a52',
-            plot_bgcolor: '#0a192f',
-            font: { color: '#64ffda' },
-            margin: { l: 0, r: 0, b: 0, t: 0 }
-        };
-        
-        Plotly.newPlot('berth-pie-chart', berth_data, berth_layout, {responsive: true});
-        
-        // Cost breakdown
-        const cost_data = [{
-            x: ['Berth A', 'Berth B', 'Berth C'],
-            y: [
-                """ + str(sum(solution.berth_schedules['A'].total_cost() for _ in [1])) + """,
-                """ + str(sum(solution.berth_schedules['B'].total_cost() for _ in [1])) + """,
-                """ + str(sum(solution.berth_schedules['C'].total_cost() for _ in [1])) + """
-            ],
-            type: 'bar',
-            marker: { color: ['rgb(31, 119, 180)', 'rgb(255, 127, 14)', 'rgb(44, 160, 44)'] }
-        }];
-        
-        const cost_layout = {
-            title: '',
-            xaxis: { title: 'Berth' },
-            yaxis: { title: 'Cost ($)' },
-            paper_bgcolor: '#1a3a52',
-            plot_bgcolor: '#0a192f',
-            font: { color: '#64ffda' },
-            margin: { l: 60, r: 30, b: 60, t: 30 }
-        };
-        
-        Plotly.newPlot('cost-chart', cost_data, cost_layout, {responsive: true});
-        
-        // Convergence chart
-        const convergence_data = [{
-            y: """ + str(convergence_data).replace("'", '"') + """,
-            type: 'scatter',
-            mode: 'lines+markers',
-            line: { color: '#64ffda', width: 2 },
-            marker: { size: 6, color: '#2c74b3' }
-        }];
-        
-        const convergence_layout = {
-            title: '',
-            xaxis: { title: 'Iteration' },
-            yaxis: { title: 'Total Cost ($)' },
-            paper_bgcolor: '#1a3a52',
-            plot_bgcolor: '#0a192f',
-            font: { color: '#64ffda' },
-            margin: { l: 60, r: 30, b: 60, t: 30 },
-            hovermode: 'closest'
-        };
-        
-        Plotly.newPlot('convergence-chart', convergence_data, convergence_layout, {responsive: true});
-        
-        // Phase table
-        const phase_html = `
-            <table class="metric-table">
-                <thead>
-                    <tr>
-                        <th>Phase</th>
-                        <th>Cost</th>
-                        <th>Time (s)</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """ + "".join([f"<tr><td>{p[0]}</td><td>${p[1]:.2f}</td><td>{p[2]:.2f}</td></tr>" for p in solution.phase_markers]) + """
-                </tbody>
-            </table>
-        `;
-        document.getElementById('phase-table').innerHTML = phase_html;
-    </script>
-</body>
-</html>
-"""
-    
-    with open("additional_output/01_expert_dashboard.html", "w") as f:
-        f.write(html)
-
-
-###############################################################################
-# SAMPLE DATA GENERATION & EXECUTION
-###############################################################################
-
-def generate_sample_vessels(num_vessels=30):
-    """Generate sample vessel data for testing"""
-    vessels = []
-    for i in range(num_vessels):
-        vessel = Vessel(
-            vessel_id=f"V{i+1:03d}",
-            arrival_time=random.randint(0, 100),
-            processing_time=random.randint(5, 20),
-            cranes_needed=random.randint(2, 6),
-            priority=random.choice(['high', 'medium', 'low']),
-            deadline=random.randint(150, 300),
-            cost_factor=random.uniform(0.8, 1.5)
+    # ── 3e. ITERATIVE CRANE BUDGET + RESEQUENCING (v6.0) ────────────
+    # Iterate until convergent: crane budget → resequence → check again
+    for cb_round in range(5):  # max 5 rounds
+        logger.info(f"Crane budget enforcement round {cb_round+1}...")
+        assignments, crane_budget_changes = _enforce_crane_budget(
+            assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights
         )
-        vessels.append(vessel)
-    return vessels
+        assignments, reseq_changes = _resequence_all_berths(
+            assignments, vessels, berths, cost_weights, w_priority
+        )
+        round_cost = sum(a["cost"] for a in assignments)
+        cost_evolution.append({
+            "iteration": iteration + 4 + cb_round,
+            "phase": f"crane_budget_r{cb_round+1}",
+            "objective_value": round(round_cost, 2)
+        })
+        logger.info(f"  Round {cb_round+1}: {crane_budget_changes} crane adjustments, "
+                     f"{reseq_changes} resequenced, cost={round_cost:.2f}")
+        if crane_budget_changes == 0:
+            break
+    post_reseq_cost = sum(a["cost"] for a in assignments)
+    logger.info(f"Final post-enforcement cost: {post_reseq_cost:.2f}")
 
+    # ── 4. Compute metrics ───────────────────────────────────────────
+    total_cost = sum(a["cost"] for a in assignments)
+    feasible_count = sum(1 for a in assignments if a.get("berth_id") is not None)
+    total_wait = sum(a.get("waiting_hours", 0) for a in assignments)
+    total_handling = sum(a.get("handling_hours", 0) for a in assignments)
+    total_teu = sum(a.get("teu_volume", 0) for a in assignments)
 
-if __name__ == '__main__':
-    # Example usage
-    print("Generating sample vessel data...")
-    vessels = generate_sample_vessels(30)
-    
-    print(f"Loaded {len(vessels)} vessels")
-    
-    # Run optimization
-    solution = optimize(vessels)
-    
-    # Print results
-    print("\n" + "="*80)
-    print("FINAL RESULTS")
-    print("="*80)
-    for berth_id, berth in solution.berth_schedules.items():
-        print(f"\nBerth {berth_id}:")
-        print(f"  Vessels: {len(berth.vessels)}")
-        print(f"  Cost: ${berth.total_cost():.2f}")
-        for vessel in berth.vessels:
-            start = berth.start_times[vessel.vessel_id]
-            end = berth.end_times[vessel.vessel_id]
-            cranes = berth.crane_allocations[vessel.vessel_id]
-            print(f"    {vessel.vessel_id}: [{start}-{end}] with {cranes} cranes")
-    
-    print(f"\nUnscheduled vessels: {len(solution.unscheduled_vessels)}")
-    if solution.unscheduled_vessels:
-        for vessel in solution.unscheduled_vessels:
-            print(f"  {vessel.vessel_id}")
-    
-    print(f"\nTotal cost: ${solution.total_cost:.2f}")
-    print(f"\nDashboard: additional_output/01_expert_dashboard.html")
-    
-    # Auto-open dashboard
-    dashboard_path = os.path.abspath('additional_output/01_expert_dashboard.html')
-    print(f"\nOpening dashboard: {dashboard_path}")
+    makespan = 0
+    if assignments:
+        end_hours = [_iso_to_hours(a["end_time"]) for a in assignments if a.get("end_time")]
+        start_hours = [_iso_to_hours(a["start_time"]) for a in assignments if a.get("start_time")]
+        if end_hours and start_hours:
+            makespan = max(end_hours) - min(start_hours)
+
+    status = "optimal" if feasible_count == n_vessels else (
+        "feasible" if feasible_count > 0 else "infeasible"
+    )
+
+    # ── 5. Build rich visual output ──────────────────────────────────
+    # Berth utilization breakdown
+    berth_utilization = []
+    for b in berths:
+        b_id = b["id"]
+        b_assignments = [a for a in assignments if a.get("berth_id") == b_id]
+        occupied_hours = sum(a.get("handling_hours", 0) for a in b_assignments)
+        util_pct = round(occupied_hours / max(makespan, 1) * 100, 1)
+        berth_utilization.append({
+            "berth_id": b_id,
+            "vessels_served": len(b_assignments),
+            "occupied_hours": round(occupied_hours, 2),
+            "utilization_pct": util_pct,
+            "total_teu_handled": sum(a.get("teu_volume", 0) for a in b_assignments)
+        })
+
+    # Cost breakdown by category
+    total_crane_cost = sum(
+        a.get("handling_hours", 0) * a.get("cranes_assigned", 1) * w_handle
+        for a in assignments if a.get("berth_id")
+    )
+    total_wait_cost = sum(
+        a.get("waiting_hours", 0) * w_wait * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
+    total_delay_cost = sum(
+        a.get("delay_hours", 0) * w_delay * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
+
+    # Crane allocation distribution
+    crane_distribution = {}
+    for a in assignments:
+        nc = a.get("cranes_assigned", 0)
+        crane_distribution[str(nc)] = crane_distribution.get(str(nc), 0) + 1
+
+    # Gantt chart data
+    gantt_data = []
+    for a in assignments:
+        if a.get("berth_id") is not None:
+            gantt_data.append({
+                "vessel": a.get("vessel_name", a["vessel_id"]),
+                "berth": a["berth_id"],
+                "start": a["start_time"],
+                "end": a["end_time"],
+                "cranes": a["cranes_assigned"],
+                "priority": a.get("priority", 3)
+            })
+
+    # Priority analysis
+    priority_analysis = {}
+    for a in assignments:
+        p = a.get("priority", 3)
+        key = f"P{p}"
+        if key not in priority_analysis:
+            priority_analysis[key] = {"count": 0, "total_cost": 0, "total_wait_h": 0, "total_delay_h": 0}
+        priority_analysis[key]["count"] += 1
+        priority_analysis[key]["total_cost"] += a.get("cost", 0)
+        priority_analysis[key]["total_wait_h"] += a.get("waiting_hours", 0)
+        priority_analysis[key]["total_delay_h"] += a.get("delay_hours", 0)
+    for key in priority_analysis:
+        pa = priority_analysis[key]
+        pa["avg_cost"] = round(pa["total_cost"] / max(pa["count"], 1), 2)
+        pa["total_cost"] = round(pa["total_cost"], 2)
+        pa["avg_wait_h"] = round(pa["total_wait_h"] / max(pa["count"], 1), 2)
+        pa["avg_delay_h"] = round(pa["total_delay_h"] / max(pa["count"], 1), 2)
+
+    improvement_pct = round((1 - total_cost / max(greedy_cost, 1)) * 100, 2) if greedy_cost > 0 else 0
+
+    elapsed = round(time.time() - start_time, 3)
+    logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
+    logger.info(f"Improvement: {improvement_pct}% over greedy (greedy={greedy_cost:.2f}, "
+                f"2-opt={two_opt_cost:.2f}, or-opt={current_cost:.2f}, crane-reopt={final_cost_after_crane_opt:.2f})")
+
+    # ── 6. Generate additional output visualizations ─────────────────
     try:
-        webbrowser.open('file://' + dashboard_path)
-    except:
-        print(f"Could not open browser. Open manually: {dashboard_path}")
+        _generate_expert_dashboard(
+            assignments=assignments,
+            berths=berths,
+            vessels=vessels,
+            cost_breakdown={
+                "total_cost": round(total_cost, 2),
+                "crane_handling_cost": round(total_crane_cost, 2),
+                "waiting_cost": round(total_wait_cost, 2),
+                "delay_penalty_cost": round(total_delay_cost, 2),
+                "cost_per_vessel": round(total_cost / max(n_vessels, 1), 2),
+                "cost_per_teu": round(total_cost / max(total_teu, 1), 4)
+            },
+            optimization_convergence={
+                "greedy_initial_cost": round(greedy_cost, 2),
+                "two_opt_cost": round(two_opt_cost, 2),
+                "crane_reopt_cost": round(final_cost_after_crane_opt, 2),
+                "final_optimized_cost": round(total_cost, 2),
+                "improvement_pct": improvement_pct,
+                "iterations_used": iteration,
+                "crane_adjustments": crane_opt_improved,
+                "cost_evolution": cost_evolution
+            },
+            berth_utilization=berth_utilization,
+            priority_analysis=priority_analysis,
+            gantt_data=gantt_data,
+            schedule_metrics={
+                "total_waiting_time": round(total_wait, 2),
+                "avg_waiting_time": round(total_wait / max(n_vessels, 1), 2),
+                "makespan": round(makespan, 2),
+                "utilization": round(total_handling / max(makespan * n_berths, 1), 4),
+                "total_teu_processed": total_teu,
+                "feasible_assignments": feasible_count,
+                "infeasible_assignments": n_vessels - feasible_count
+            },
+            computation_metrics={
+                "wall_time_s": elapsed,
+                "algorithm": "Greedy_2Opt_OrOpt_3Opt_CraneRebalance_BAP_QCA",
+                "iterations": iteration,
+                "or_opt_improvements": oropt_improved,
+                "three_opt_improvements": threeopt_improved,
+                "crane_rebalance_improvements": crane_opt_improved,
+                "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
+                "solver_version": "6.0"
+            },
+            crane_allocation={
+                "distribution": crane_distribution,
+                "avg_cranes_per_vessel": round(
+                    sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_count, 1), 2
+                ),
+                "total_crane_hours": round(
+                    sum(a.get("handling_hours", 0) * a.get("cranes_assigned", 0) for a in assignments), 2
+                )
+            }
+        )
+        logger.info("Expert dashboard generated successfully (v6.0)")
+    except Exception as e:
+        logger.warning(f"Failed to generate expert dashboard: {e}")
+
+    return {
+        # ── Core assignment result ──
+        "assignments": assignments,
+        "objective_value": round(total_cost, 2),
+        "solution_status": status,
+
+        # ── Input size metrics ──
+        "num_vessels": n_vessels,
+        "num_berths": n_berths,
+        "total_cranes": total_cranes,
+
+        # ── Schedule metrics ──
+        "schedule_metrics": {
+            "total_waiting_time": round(total_wait, 2),
+            "avg_waiting_time": round(total_wait / max(n_vessels, 1), 2),
+            "makespan": round(makespan, 2),
+            "utilization": round(total_handling / max(makespan * n_berths, 1), 4),
+            "total_teu_processed": total_teu,
+            "feasible_assignments": feasible_count,
+            "infeasible_assignments": n_vessels - feasible_count
+        },
+
+        # ── Visual: Cost breakdown (pie/bar chart ready) ──
+        "cost_breakdown": {
+            "total_cost": round(total_cost, 2),
+            "crane_handling_cost": round(total_crane_cost, 2),
+            "waiting_cost": round(total_wait_cost, 2),
+            "delay_penalty_cost": round(total_delay_cost, 2),
+            "cost_per_vessel": round(total_cost / max(n_vessels, 1), 2),
+            "cost_per_teu": round(total_cost / max(total_teu, 1), 4)
+        },
+
+        # ── Visual: Optimization convergence (line chart ready) ──
+        "optimization_convergence": {
+            "greedy_initial_cost": round(greedy_cost, 2),
+            "two_opt_cost": round(two_opt_cost, 2),
+            "crane_reopt_cost": round(final_cost_after_crane_opt, 2),
+            "final_optimized_cost": round(total_cost, 2),
+            "improvement_pct": improvement_pct,
+            "iterations_used": iteration,
+            "crane_adjustments": crane_opt_improved,
+            "cost_evolution": cost_evolution
+        },
+
+        # ── Visual: Berth utilization (bar chart ready) ──
+        "berth_utilization": berth_utilization,
+
+        # ── Visual: Crane allocation distribution (histogram ready) ──
+        "crane_allocation": {
+            "distribution": crane_distribution,
+            "avg_cranes_per_vessel": round(
+                sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_count, 1), 2
+            ),
+            "total_crane_hours": round(
+                sum(a.get("handling_hours", 0) * a.get("cranes_assigned", 0) for a in assignments), 2
+            )
+        },
+
+        # ── Visual: Gantt chart data (timeline ready) ──
+        "gantt_schedule": gantt_data,
+
+        # ── Visual: Priority analysis (grouped bar chart ready) ──
+        "priority_analysis": priority_analysis,
+
+        # ── Computation metrics ──
+        "computation_metrics": {
+            "wall_time_s": elapsed,
+            "algorithm": "Greedy_2Opt_OrOpt_3Opt_CraneRebalance_BAP_QCA",
+            "iterations": iteration,
+            "or_opt_improvements": oropt_improved,
+            "three_opt_improvements": threeopt_improved,
+            "crane_rebalance_improvements": crane_opt_improved,
+            "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
+            "solver_version": "6.0"
+        },
+
+        # ── Platform benchmark contract ──
+        "benchmark": {
+            "execution_cost": {"value": 1.0, "unit": "credits"},
+            "time_elapsed": f"{elapsed}s",
+            "energy_consumption": 0.0
+        }
+    }
+
+
+# ── v6.0 Helper functions ───────────────────────────────────────────
+
