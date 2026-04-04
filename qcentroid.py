@@ -1,7 +1,12 @@
 """
-Classical BAP+QCA Greedy-2Opt Solver
+Classical BAP+QCA Greedy-2Opt Solver v3.0
 Berth Allocation + Quay Crane Assignment using greedy construction + 2-opt local search.
-Enhanced with rich visual output for benchmarking dashboards.
+
+v3.0 changes:
+- Fixed _try_swap: now explores all crane levels during 2-opt (was hardcoded to min_cranes)
+- Added crane re-optimization pass after 2-opt berth swaps
+- Improved cost breakdown with waiting/delay separation
+- Enhanced rich visual output for benchmarking dashboards
 """
 import logging
 import time
@@ -12,7 +17,7 @@ logger = logging.getLogger("qcentroid-user-log")
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Classical BAP+QCA Greedy-2Opt Solver v2.0 ===")
+    logger.info("=== Classical BAP+QCA Greedy-2Opt Solver v3.0 ===")
 
     # ── 1. Parse inputs ──────────────────────────────────────────────
     vessels = input_data.get("vessels", [])
@@ -39,7 +44,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     # ── 2. Greedy construction ───────────────────────────────────────
     assignments = []
     berth_end_times = {}
-    cost_evolution = []  # Track cost improvement over iterations
+    cost_evolution = []
 
     for v in sorted_vessels:
         v_id = v["id"]
@@ -56,6 +61,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         best_start = None
         best_cranes_assigned = min_cranes
         best_handling_hours = 0
+        best_wait_hours = 0
+        best_delay_hours = 0
 
         for b in berths:
             b_id = b["id"]
@@ -88,6 +95,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                     best_start = actual_start
                     best_cranes_assigned = nc
                     best_handling_hours = handling_hours
+                    best_wait_hours = wait_hours
+                    best_delay_hours = delay_hours
 
         if best_berth is not None:
             end_time_str = _hours_to_iso(
@@ -104,6 +113,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "end_time": end_time_str,
                 "cranes_assigned": best_cranes_assigned,
                 "handling_hours": round(best_handling_hours, 2),
+                "waiting_hours": round(best_wait_hours, 2),
+                "delay_hours": round(best_delay_hours, 2),
                 "cost": round(best_cost, 2),
                 "priority": v_priority,
                 "teu_volume": v_teu
@@ -124,8 +135,9 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
     greedy_cost = sum(a["cost"] for a in assignments)
     cost_evolution.append({"iteration": 0, "phase": "greedy", "objective_value": round(greedy_cost, 2)})
+    logger.info(f"Greedy phase complete: cost={greedy_cost:.2f}")
 
-    # ── 3. 2-opt local search improvement ────────────────────────────
+    # ── 3. 2-opt local search improvement (v3: with crane optimization) ──
     max_iterations = solver_params.get("max_2opt_iterations", 100)
     improved = True
     iteration = 0
@@ -153,22 +165,74 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "objective_value": round(current_cost, 2)
         })
 
-    logger.info(f"2-opt completed after {iteration} iterations")
+    two_opt_cost = sum(a["cost"] for a in assignments)
+    logger.info(f"2-opt completed after {iteration} iterations: cost={two_opt_cost:.2f}")
+
+    # ── 3b. Crane re-optimization pass (v3 new) ─────────────────────
+    crane_opt_improved = 0
+    for idx, a in enumerate(assignments):
+        if a.get("berth_id") is None:
+            continue
+        v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+        b_data = next((b for b in berths if b["id"] == a["berth_id"]), None)
+        if not v_data or not b_data:
+            continue
+
+        v_teu = v_data.get("handling_volume_teu", 1000)
+        v_priority = v_data.get("priority", 3)
+        pm = w_priority if v_priority <= 2 else 1.0
+        b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
+
+        best_nc = a["cranes_assigned"]
+        best_cost = a["cost"]
+
+        for nc in range(min_cranes, min(max_cranes, total_cranes) + 1):
+            handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+            end_h = _iso_to_hours(a["start_time"]) + handling_h
+            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+            arr_h = _iso_to_hours(v_data.get("arrival_time", a["start_time"]))
+            wait_h = max(0, _iso_to_hours(a["start_time"]) - arr_h)
+            delay_h = max(0, end_h - deadline_h)
+
+            cost = (handling_h * nc * w_handle +
+                    wait_h * w_wait * pm +
+                    delay_h * w_delay * pm)
+
+            if cost < best_cost:
+                best_cost = cost
+                best_nc = nc
+
+        if best_nc != a["cranes_assigned"]:
+            handling_h = v_teu / (b_prod * best_nc) if b_prod * best_nc > 0 else 999
+            end_h = _iso_to_hours(a["start_time"]) + handling_h
+            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+            delay_h = max(0, end_h - deadline_h)
+            wait_h = a.get("waiting_hours", 0)
+
+            assignments[idx] = dict(a)
+            assignments[idx]["cranes_assigned"] = best_nc
+            assignments[idx]["handling_hours"] = round(handling_h, 2)
+            assignments[idx]["delay_hours"] = round(delay_h, 2)
+            assignments[idx]["cost"] = round(best_cost, 2)
+            assignments[idx]["end_time"] = _hours_to_iso(end_h, a["start_time"])
+            crane_opt_improved += 1
+
+    final_cost_after_crane_opt = sum(a["cost"] for a in assignments)
+    if crane_opt_improved > 0:
+        cost_evolution.append({
+            "iteration": iteration + 1,
+            "phase": "crane_reopt",
+            "objective_value": round(final_cost_after_crane_opt, 2)
+        })
+        logger.info(f"Crane re-optimization improved {crane_opt_improved} assignments: "
+                     f"cost={final_cost_after_crane_opt:.2f}")
 
     # ── 4. Compute metrics ───────────────────────────────────────────
     total_cost = sum(a["cost"] for a in assignments)
     feasible_count = sum(1 for a in assignments if a.get("berth_id") is not None)
-    total_wait = 0
-    total_handling = 0
-    total_teu = 0
-
-    for a in assignments:
-        total_handling += a.get("handling_hours", 0)
-        total_teu += a.get("teu_volume", 0)
-        if a.get("start_time") and a.get("vessel_id"):
-            v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), {})
-            arr = v_data.get("arrival_time", a["start_time"])
-            total_wait += max(0, _iso_to_hours(a["start_time"]) - _iso_to_hours(arr))
+    total_wait = sum(a.get("waiting_hours", 0) for a in assignments)
+    total_handling = sum(a.get("handling_hours", 0) for a in assignments)
+    total_teu = sum(a.get("teu_volume", 0) for a in assignments)
 
     makespan = 0
     if assignments:
@@ -198,39 +262,26 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         })
 
     # Cost breakdown by category
-    total_crane_cost = 0
-    total_wait_cost = 0
-    total_delay_cost = 0
-    for a in assignments:
-        if a.get("berth_id") is None:
-            continue
-        v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), {})
-        b_data = next((b for b in berths if b["id"] == a["berth_id"]), {})
-        v_priority = v_data.get("priority", 3)
-        pm = w_priority if v_priority <= 2 else 1.0
-        b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
-
-        crane_c = a.get("handling_hours", 0) * a.get("cranes_assigned", 1) * w_handle
-        arr_h = _iso_to_hours(v_data.get("arrival_time", a["start_time"]))
-        start_h = _iso_to_hours(a["start_time"])
-        wait_h = max(0, start_h - arr_h)
-        wait_c = wait_h * w_wait * pm
-        end_h = _iso_to_hours(a["end_time"])
-        deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
-        delay_h = max(0, end_h - deadline_h)
-        delay_c = delay_h * w_delay * pm
-
-        total_crane_cost += crane_c
-        total_wait_cost += wait_c
-        total_delay_cost += delay_c
+    total_crane_cost = sum(
+        a.get("handling_hours", 0) * a.get("cranes_assigned", 1) * w_handle
+        for a in assignments if a.get("berth_id")
+    )
+    total_wait_cost = sum(
+        a.get("waiting_hours", 0) * w_wait * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
+    total_delay_cost = sum(
+        a.get("delay_hours", 0) * w_delay * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
 
     # Crane allocation distribution
     crane_distribution = {}
     for a in assignments:
         nc = a.get("cranes_assigned", 0)
-        crane_distribution[nc] = crane_distribution.get(nc, 0) + 1
+        crane_distribution[str(nc)] = crane_distribution.get(str(nc), 0) + 1
 
-    # Gantt chart data (timeline per berth)
+    # Gantt chart data
     gantt_data = []
     for a in assignments:
         if a.get("berth_id") is not None:
@@ -249,19 +300,24 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         p = a.get("priority", 3)
         key = f"P{p}"
         if key not in priority_analysis:
-            priority_analysis[key] = {"count": 0, "total_cost": 0, "avg_wait": 0, "total_wait": 0}
+            priority_analysis[key] = {"count": 0, "total_cost": 0, "total_wait_h": 0, "total_delay_h": 0}
         priority_analysis[key]["count"] += 1
         priority_analysis[key]["total_cost"] += a.get("cost", 0)
+        priority_analysis[key]["total_wait_h"] += a.get("waiting_hours", 0)
+        priority_analysis[key]["total_delay_h"] += a.get("delay_hours", 0)
     for key in priority_analysis:
         pa = priority_analysis[key]
         pa["avg_cost"] = round(pa["total_cost"] / max(pa["count"], 1), 2)
         pa["total_cost"] = round(pa["total_cost"], 2)
+        pa["avg_wait_h"] = round(pa["total_wait_h"] / max(pa["count"], 1), 2)
+        pa["avg_delay_h"] = round(pa["total_delay_h"] / max(pa["count"], 1), 2)
 
     improvement_pct = round((1 - total_cost / max(greedy_cost, 1)) * 100, 2) if greedy_cost > 0 else 0
 
     elapsed = round(time.time() - start_time, 3)
     logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
-    logger.info(f"2-opt improvement: {improvement_pct}% over greedy baseline")
+    logger.info(f"Improvement: {improvement_pct}% over greedy (greedy={greedy_cost:.2f}, "
+                f"2-opt={two_opt_cost:.2f}, crane-reopt={final_cost_after_crane_opt:.2f})")
 
     return {
         # ── Core assignment result ──
@@ -269,7 +325,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "objective_value": round(total_cost, 2),
         "solution_status": status,
 
-        # ── Input size metrics (for benchmarking) ──
+        # ── Input size metrics ──
         "num_vessels": n_vessels,
         "num_berths": n_berths,
         "total_cranes": total_cranes,
@@ -298,9 +354,12 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         # ── Visual: Optimization convergence (line chart ready) ──
         "optimization_convergence": {
             "greedy_initial_cost": round(greedy_cost, 2),
+            "two_opt_cost": round(two_opt_cost, 2),
+            "crane_reopt_cost": round(final_cost_after_crane_opt, 2),
             "final_optimized_cost": round(total_cost, 2),
             "improvement_pct": improvement_pct,
             "iterations_used": iteration,
+            "crane_adjustments": crane_opt_improved,
             "cost_evolution": cost_evolution
         },
 
@@ -327,10 +386,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         # ── Computation metrics ──
         "computation_metrics": {
             "wall_time_s": elapsed,
-            "algorithm": "Greedy_2Opt_BAP_QCA",
+            "algorithm": "Greedy_2Opt_CraneReopt_BAP_QCA",
             "iterations": iteration,
+            "crane_reopt_improvements": crane_opt_improved,
             "search_space_explored": n_vessels * n_berths * (max_cranes - min_cranes + 1),
-            "solver_version": "2.0"
+            "solver_version": "3.0"
         },
 
         # ── Platform benchmark contract ──
@@ -380,7 +440,9 @@ def _hours_to_iso(hours, reference_iso):
 
 
 def _try_swap(a1, a2, berths, vessels, cost_weights, cranes_cfg):
-    """Try swapping berth assignments of two vessels. Return new assignments or None."""
+    """Try swapping berth assignments of two vessels.
+    v3 FIX: explores all crane levels instead of hardcoding min_cranes.
+    """
     b1_id, b2_id = a1["berth_id"], a2["berth_id"]
     if b1_id == b2_id:
         return None, None
@@ -407,35 +469,66 @@ def _try_swap(a1, a2, berths, vessels, cost_weights, cranes_cfg):
     w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
     w_priority = cost_weights.get("priority_multiplier", 1.5)
     min_cranes = cranes_cfg.get("min_per_vessel", 1)
+    max_cranes = cranes_cfg.get("max_per_vessel", 4)
+    total_cranes = cranes_cfg.get("total_available", 10)
 
-    def calc_cost(v, b, start_time):
-        nc = min_cranes
+    def calc_best_cost(v, b, start_time):
+        """v3 FIX: Try all crane levels, return best cost + crane count."""
         prod = b.get("productivity_teu_per_crane_hour", 25)
         teu = v.get("handling_volume_teu", 1000)
-        handling_h = teu / (prod * nc) if prod * nc > 0 else 999
-        end_h = _iso_to_hours(start_time) + handling_h
-        deadline_h = _iso_to_hours(v.get("max_departure_time", "2025-12-31T23:59:00Z"))
-        arr_h = _iso_to_hours(v.get("arrival_time", start_time))
-        wait_h = max(0, _iso_to_hours(start_time) - arr_h)
-        delay_h = max(0, end_h - deadline_h)
         p = v.get("priority", 3)
         pm = w_priority if p <= 2 else 1.0
-        return (handling_h * nc * w_handle + wait_h * w_wait * pm +
-                delay_h * w_delay * pm), handling_h, nc
+        arr_h = _iso_to_hours(v.get("arrival_time", start_time))
+        deadline_h = _iso_to_hours(v.get("max_departure_time", "2025-12-31T23:59:00Z"))
+        start_h = _iso_to_hours(start_time)
+        wait_h = max(0, start_h - arr_h)
 
-    c1, h1, nc1 = calc_cost(v1, b2, a1["start_time"])
-    c2, h2, nc2 = calc_cost(v2, b1, a2["start_time"])
+        best_nc = min_cranes
+        best_cost = float("inf")
+        best_handling = 0
+
+        for nc in range(min_cranes, min(max_cranes, total_cranes) + 1):
+            handling_h = teu / (prod * nc) if prod * nc > 0 else 999
+            end_h = start_h + handling_h
+            delay_h = max(0, end_h - deadline_h)
+            cost = (handling_h * nc * w_handle +
+                    wait_h * w_wait * pm +
+                    delay_h * w_delay * pm)
+            if cost < best_cost:
+                best_cost = cost
+                best_nc = nc
+                best_handling = handling_h
+
+        return best_cost, best_handling, best_nc, wait_h
+
+    c1, h1, nc1, w1 = calc_best_cost(v1, b2, a1["start_time"])
+    c2, h2, nc2, w2 = calc_best_cost(v2, b1, a2["start_time"])
+
+    # Compute delay hours for output
+    end1_h = _iso_to_hours(a1["start_time"]) + h1
+    deadline1_h = _iso_to_hours(v1.get("max_departure_time", "2025-12-31T23:59:00Z"))
+    delay1_h = max(0, end1_h - deadline1_h)
+
+    end2_h = _iso_to_hours(a2["start_time"]) + h2
+    deadline2_h = _iso_to_hours(v2.get("max_departure_time", "2025-12-31T23:59:00Z"))
+    delay2_h = max(0, end2_h - deadline2_h)
 
     new_a1 = dict(a1)
     new_a1["berth_id"] = b2_id
     new_a1["cost"] = round(c1, 2)
     new_a1["handling_hours"] = round(h1, 2)
     new_a1["cranes_assigned"] = nc1
+    new_a1["waiting_hours"] = round(w1, 2)
+    new_a1["delay_hours"] = round(delay1_h, 2)
+    new_a1["end_time"] = _hours_to_iso(end1_h, a1["start_time"])
 
     new_a2 = dict(a2)
     new_a2["berth_id"] = b1_id
     new_a2["cost"] = round(c2, 2)
     new_a2["handling_hours"] = round(h2, 2)
     new_a2["cranes_assigned"] = nc2
+    new_a2["waiting_hours"] = round(w2, 2)
+    new_a2["delay_hours"] = round(delay2_h, 2)
+    new_a2["end_time"] = _hours_to_iso(end2_h, a2["start_time"])
 
     return new_a1, new_a2
