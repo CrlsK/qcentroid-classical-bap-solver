@@ -394,5 +394,3 @@ def _try_swap(a1, a2, berths, vessels, cost_weights, cranes_cfg):
     new_a2["end_time"] = _hours_to_iso(end2_h, a2["start_time"])
 
     return new_a1, new_a2
-
-
