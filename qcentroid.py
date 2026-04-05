@@ -1,11 +1,11 @@
 """
-Classical BAP+QCA Solver v9.0
+Classical BAP+QCA Solver v10.0
 Berth Allocation + Quay Crane Assignment.
-v9.0: Simulated Annealing meta-heuristic after greedy+local-search.
-  - Hard crane cap during greedy (v8.1 carry-over)
-  - Multi-start SA with adaptive cooling to escape local optima
-  - Global resequence after each SA move for accurate costing
-  - Crane-budget-aware neighbor generation
+v10.0: Tuned SA with priority-aware moves + restart mechanism.
+  - SA tuning: slower cooling (0.995), lower T_min (10), 25s limit
+  - Priority-weighted move selection (favors P1/P2 vessel optimization)
+  - Restart from best solution when SA stalls (reheat)
+  - Compound moves: simultaneous berth+crane adjustments
 """
 import logging
 import time
@@ -30,8 +30,7 @@ def _recalc_full_cost(assignments, vessels, berths, cost_weights, w_priority_mul
 
 
 def _sa_neighbor(assignments, vessels, berths, cost_weights, cranes_cfg, w_priority_mult, rng):
-    """Generate SA neighbor via one of 4 move types."""
-    move_type = rng.randint(0, 3)
+    """Generate SA neighbor via priority-weighted move selection (v10.0)."""
     candidate = [dict(a) for a in assignments]
     feasible = [i for i, a in enumerate(candidate) if a.get("berth_id") is not None]
 
@@ -41,28 +40,54 @@ def _sa_neighbor(assignments, vessels, berths, cost_weights, cranes_cfg, w_prior
     min_cranes = cranes_cfg.get("min_per_vessel", 1)
     max_cranes = cranes_cfg.get("max_per_vessel", 6)
 
+    # v10.0: Priority-weighted move selection — favor moves on high-cost vessels
+    costs = [(i, candidate[i].get("cost", 0)) for i in feasible]
+    costs.sort(key=lambda x: -x[1])  # highest cost first
+    # 60% chance to pick from top-3 costliest vessels for targeted moves
+    high_cost_indices = [c[0] for c in costs[:3]]
+
+    move_type = rng.randint(0, 4)
+    target_idx = None
+
+    if move_type < 3 and rng.random() < 0.6 and high_cost_indices:
+        target_idx = rng.choice(high_cost_indices)
+    else:
+        target_idx = rng.choice(feasible)
+
     if move_type == 0:
-        # Move 1: Swap berths of two random vessels
-        i, j = rng.sample(feasible, 2)
-        a1, a2 = candidate[i], candidate[j]
-        b1, b2 = a1["berth_id"], a2["berth_id"]
-        if b1 != b2:
-            v1 = next((v for v in vessels if v["id"] == a1["vessel_id"]), None)
-            v2 = next((v for v in vessels if v["id"] == a2["vessel_id"]), None)
-            bd1 = next((b for b in berths if b["id"] == b1), None)
-            bd2 = next((b for b in berths if b["id"] == b2), None)
-            if v1 and v2 and bd1 and bd2:
-                fit1 = v1.get("length_m", 200) <= bd2.get("length_m", 300) and v1.get("draft_m", 12) <= bd2.get("depth_m", 15)
-                fit2 = v2.get("length_m", 200) <= bd1.get("length_m", 300) and v2.get("draft_m", 12) <= bd1.get("depth_m", 15)
-                if fit1 and fit2:
-                    candidate[i]["berth_id"] = b2
-                    candidate[j]["berth_id"] = b1
-                    return candidate, "swap_berth"
+        # Compound Move: Berth + Crane adjustment for target vessel
+        a = candidate[target_idx]
+        b_id = a["berth_id"]
+        other_berths = [b["id"] for b in berths if b["id"] != b_id]
+        if other_berths:
+            new_b_id = rng.choice(other_berths)
+            new_nc = max(min_cranes, min(max_cranes, a["cranes_assigned"] + rng.choice([-1, 1])))
+            candidate[target_idx]["berth_id"] = new_b_id
+            candidate[target_idx]["cranes_assigned"] = new_nc
+            return candidate, "compound_move"
 
     elif move_type == 1:
-        # Move 2: Relocate vessel to different berth
-        idx = rng.choice(feasible)
-        a = candidate[idx]
+        # Swap berths of two random vessels
+        if len(feasible) >= 2:
+            i, j = rng.sample(feasible, 2)
+            a1, a2 = candidate[i], candidate[j]
+            b1, b2 = a1["berth_id"], a2["berth_id"]
+            if b1 != b2:
+                v1 = next((v for v in vessels if v["id"] == a1["vessel_id"]), None)
+                v2 = next((v for v in vessels if v["id"] == a2["vessel_id"]), None)
+                bd1 = next((b for b in berths if b["id"] == b1), None)
+                bd2 = next((b for b in berths if b["id"] == b2), None)
+                if v1 and v2 and bd1 and bd2:
+                    fit1 = v1.get("length_m", 200) <= bd2.get("length_m", 300) and v1.get("draft_m", 12) <= bd2.get("depth_m", 15)
+                    fit2 = v2.get("length_m", 200) <= bd1.get("length_m", 300) and v2.get("draft_m", 12) <= bd1.get("depth_m", 15)
+                    if fit1 and fit2:
+                        candidate[i]["berth_id"] = b2
+                        candidate[j]["berth_id"] = b1
+                        return candidate, "swap_berth"
+
+    elif move_type == 2:
+        # Relocate target vessel
+        a = candidate[target_idx]
         v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
         if v_data:
             other_berths = [b for b in berths if b["id"] != a["berth_id"]
@@ -70,25 +95,21 @@ def _sa_neighbor(assignments, vessels, berths, cost_weights, cranes_cfg, w_prior
                            and v_data.get("draft_m", 12) <= b.get("depth_m", 15)]
             if other_berths:
                 new_b = rng.choice(other_berths)
-                candidate[idx]["berth_id"] = new_b["id"]
+                candidate[target_idx]["berth_id"] = new_b["id"]
                 return candidate, "relocate"
 
-    elif move_type == 2:
-        # Move 3: Change crane count for a random vessel
-        idx = rng.choice(feasible)
-        a = candidate[idx]
+    elif move_type == 3:
+        # Change crane count for target vessel
+        a = candidate[target_idx]
         current_nc = a["cranes_assigned"]
         delta = rng.choice([-2, -1, 1, 2])
         new_nc = max(min_cranes, min(max_cranes, current_nc + delta))
         if new_nc != current_nc:
-            v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
-            b_data = next((b for b in berths if b["id"] == a["berth_id"]), None)
-            if v_data and b_data:
-                candidate[idx]["cranes_assigned"] = new_nc
-                return candidate, "crane_adj"
+            candidate[target_idx]["cranes_assigned"] = new_nc
+            return candidate, "crane_adj"
 
     else:
-        # Move 4: Swap order of two vessels at same berth
+        # Swap order of two vessels at same berth
         berth_groups = {}
         for i in feasible:
             bid = candidate[i]["berth_id"]
@@ -97,7 +118,6 @@ def _sa_neighbor(assignments, vessels, berths, cost_weights, cranes_cfg, w_prior
         if multi:
             group = rng.choice(multi)
             i, j = rng.sample(group, 2)
-            # Swap vessel assignments (keep berth, swap vessels)
             for key in ["vessel_id", "vessel_name", "priority", "teu_volume"]:
                 candidate[i][key], candidate[j][key] = candidate[j].get(key), candidate[i].get(key)
             return candidate, "swap_order"
@@ -107,7 +127,7 @@ def _sa_neighbor(assignments, vessels, berths, cost_weights, cranes_cfg, w_prior
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Classical BAP+QCA Solver v9.0 — Simulated Annealing ===")
+    logger.info("=== Classical BAP+QCA Solver v10.0 — Simulated Annealing with Priority-Aware Moves ===")
 
     vessels = input_data.get("vessels", [])
     berths = input_data.get("berths", [])
@@ -127,14 +147,12 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_berths = len(berths)
     logger.info("Problem: %d vessels, %d berths, %d cranes", n_vessels, n_berths, total_cranes)
 
-    # v8.1: HARD crane cap during greedy
     greedy_max_cranes = max(min_cranes, min(total_cranes // n_berths, max_cranes))
-    logger.info("v9.0: Greedy crane cap = %d | SA post-optimization enabled", greedy_max_cranes)
+    logger.info("v10.0: Greedy crane cap = %d | SA post-optimization enabled", greedy_max_cranes)
 
-    # Sort vessels by priority then arrival
     sorted_vessels = sorted(vessels, key=lambda v: (v.get("priority", 5), v.get("arrival_time", "")))
 
-    # ── PHASE 1: Greedy construction (same as v8.1) ──────────────────
+    # ── PHASE 1: Greedy construction ──────────────────────────────
     assignments = []
     berth_end_times = {}
     berth_vessel_count = {b["id"]: 0 for b in berths}
@@ -237,7 +255,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "priority": v_priority, "teu_volume": v_teu
             })
         else:
-            # Fallback
             for b in berths:
                 b_id = b["id"]
                 if v_len > b.get("length_m", 300) or v_draft > b.get("depth_m", 15.0):
@@ -278,12 +295,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                     "status": "infeasible"
                 })
 
-    # Resequence for accurate greedy cost
     greedy_cost, assignments = _recalc_full_cost(assignments, vessels, berths, cost_weights, w_priority)
     cost_evolution.append({"iteration": 0, "phase": "greedy", "objective_value": round(greedy_cost, 2)})
     logger.info("Greedy phase: cost=$%s", "{:,.2f}".format(greedy_cost))
 
-    # ── PHASE 2: 2-opt local search ──────────────────────────────────
+    # ── PHASE 2: 2-opt local search ──────────────────────────────
     max_iterations = solver_params.get("max_2opt_iterations", 50)
     improved = True
     iteration = 0
@@ -310,7 +326,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     two_opt_cost = sum(a["cost"] for a in assignments)
     logger.info("2-opt completed: cost=$%s", "{:,.2f}".format(two_opt_cost))
 
-    # ── PHASE 2b: Or-opt moves ────────────────────────────────────────
+    # ── PHASE 2b: Or-opt moves ───────────────────────────────────
     oropt_improved = 0
     max_vessels_per_berth = math.ceil(n_vessels / n_berths) + 1
     for idx, a in enumerate(assignments):
@@ -348,7 +364,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     cost_evolution.append({"iteration": 1, "phase": "or-opt", "objective_value": round(oropt_cost, 2)})
     logger.info("Or-opt moves: %d improvements, cost=$%s", oropt_improved, "{:,.2f}".format(oropt_cost))
 
-    # ── PHASE 3: Crane rebalancing ───────────────────────────────────
+    # ── PHASE 3: Crane rebalancing ───────────────────────────────
     crane_rebalance_improvements = 0
     for idx, a in enumerate(assignments):
         if a.get("berth_id") is None:
@@ -378,7 +394,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     cost_evolution.append({"iteration": 1, "phase": "crane_reopt", "objective_value": round(crane_reopt_cost, 2)})
     logger.info("Crane rebalance: %d adjustments, cost=$%s", crane_rebalance_improvements, "{:,.2f}".format(crane_reopt_cost))
 
-    # ── PHASE 4: Simulated Annealing ─────────────────────────────────
+    # ── PHASE 4: Simulated Annealing v10.0 ───────────────────────
     sa_enabled = solver_params.get("simulated_annealing_enabled", True)
     if not sa_enabled:
         logger.info("Simulated Annealing disabled")
@@ -387,12 +403,14 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         sa_accepted = 0
         sa_improved = 0
         sa_temperature_final = 0.0
+        sa_restarts = 0
     else:
         rng = random.Random(solver_params.get("random_seed", 42))
-        sa_max_iters = solver_params.get("simulated_annealing_max_iterations", 500)
+        sa_max_iters = solver_params.get("simulated_annealing_max_iterations", 1000)
         sa_initial_temp = solver_params.get("simulated_annealing_initial_temperature", 5000.0)
-        sa_cooling_rate = solver_params.get("simulated_annealing_cooling_rate", 0.95)
-        sa_min_temp = solver_params.get("simulated_annealing_min_temperature", 1.0)
+        sa_cooling_rate = solver_params.get("simulated_annealing_cooling_rate", 0.995)
+        sa_min_temp = solver_params.get("simulated_annealing_min_temperature", 10.0)
+        sa_time_limit = solver_params.get("simulated_annealing_time_limit_s", 25.0)
 
         best_overall_cost = crane_reopt_cost
         best_overall_assignments = [dict(a) for a in assignments]
@@ -402,9 +420,14 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         sa_iterations = 0
         sa_accepted = 0
         sa_improved = 0
+        sa_restarts = 0
         temperature = sa_initial_temp
+        stall_counter = 0
+        stall_threshold = 100
 
-        while temperature > sa_min_temp and sa_iterations < sa_max_iters:
+        sa_start_time = time.time()
+
+        while temperature > sa_min_temp and sa_iterations < sa_max_iters and (time.time() - sa_start_time) < sa_time_limit:
             candidate_assignments, move_type = _sa_neighbor(current_assignments, vessels, berths, cost_weights, cranes_cfg, w_priority, rng)
             if move_type == "noop":
                 sa_iterations += 1
@@ -418,10 +441,21 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 current_assignments = candidate_assignments
                 current_cost = candidate_cost
                 sa_accepted += 1
+                stall_counter = 0
                 if candidate_cost < best_overall_cost:
                     best_overall_cost = candidate_cost
                     best_overall_assignments = [dict(a) for a in candidate_assignments]
                     sa_improved += 1
+            else:
+                stall_counter += 1
+
+            # v10.0: Restart mechanism — if stalled, reheat from best
+            if stall_counter >= stall_threshold:
+                current_assignments = [dict(a) for a in best_overall_assignments]
+                current_cost = best_overall_cost
+                temperature = sa_initial_temp * 0.5  # Reduced reheat
+                stall_counter = 0
+                sa_restarts += 1
 
             sa_iterations += 1
             temperature *= sa_cooling_rate
@@ -431,20 +465,19 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         sa_temperature_final = temperature
 
     cost_evolution.append({"iteration": 1, "phase": "simulated_annealing", "objective_value": round(sa_cost, 2)})
-    logger.info("SA: %d iterations, %d accepted, %d improved, final temp=%.1f, cost=$%s",
-                sa_iterations, sa_accepted, sa_improved, sa_temperature_final,
+    logger.info("SA v10.0: %d iterations, %d accepted, %d improved, %d restarts, final temp=%.1f, cost=$%s",
+                sa_iterations, sa_accepted, sa_improved, sa_restarts, sa_temperature_final,
                 "{:,.2f}".format(sa_cost))
 
-    # ── FINAL: Resequence for accurate cost ──────────────────────────
+    # ── FINAL: Resequence for accurate cost ──────────────────────
     final_cost, assignments = _recalc_full_cost(assignments, vessels, berths, cost_weights, w_priority)
     cost_evolution.append({"iteration": 1, "phase": "final", "objective_value": round(final_cost, 2)})
 
-    # ── Output metrics ───────────────────────────────────────────────
     wall_time = time.time() - start_time
 
     # Cost breakdown
     total_handling_cost = sum(
-        _iso_to_hours(a.get("end_time", a.get("start_time", "2025-01-01T00:00:00Z"))) - _iso_to_hours(a.get("start_time", "2025-01-01T00:00:00Z")) * a.get("cranes_assigned", 0) * w_handle
+        (_iso_to_hours(a.get("end_time", a.get("start_time", "2025-01-01T00:00:00Z"))) - _iso_to_hours(a.get("start_time", "2025-01-01T00:00:00Z"))) * a.get("cranes_assigned", 0) * w_handle
         if a.get("berth_id") is not None else 0
         for a in assignments
     )
@@ -460,7 +493,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "cost_per_teu": round(final_cost / sum(v.get("handling_volume_teu", 1000) for v in vessels), 2)
     }
 
-    # Schedule metrics
     feasible_assignments = sum(1 for a in assignments if a.get("berth_id") is not None)
     infeasible_assignments = len(assignments) - feasible_assignments
     makespan = max((_iso_to_hours(a.get("end_time", "2025-01-01T00:00:00Z")) for a in assignments if a.get("berth_id") is not None), default=0)
@@ -473,7 +505,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "total_waiting_time": round(total_waiting, 2)
     }
 
-    # Berth utilization
     berth_utilization = []
     for b in berths:
         b_id = b["id"]
@@ -493,7 +524,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "total_teu_handled": total_teu
         })
 
-    # Priority analysis
     priority_analysis = {}
     for p in [1, 2, 3, 4, 5]:
         p_assignments = [a for a in assignments if a.get("priority") == p and a.get("berth_id") is not None]
@@ -506,7 +536,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "total_cost": round(sum(a.get("cost", 0) for a in p_assignments), 2)
             }
 
-    # Gantt data
     gantt_data = [
         {
             "vessel": a.get("vessel_name", a.get("vessel_id")),
@@ -519,11 +548,9 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         for a in assignments if a.get("berth_id") is not None
     ]
 
-    # Crane allocation
     avg_cranes = sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_assignments, 1) if feasible_assignments > 0 else 0
     crane_allocation = {"avg_cranes_per_vessel": round(avg_cranes, 2)}
 
-    # Optimization convergence metrics
     optimization_convergence = {
         "cost_evolution": cost_evolution,
         "greedy_initial_cost": round(cost_evolution[0]["objective_value"], 2),
@@ -535,19 +562,18 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "sa_iterations": sa_iterations,
         "sa_accepted": sa_accepted,
         "sa_improved": sa_improved,
+        "sa_restarts": sa_restarts,
         "sa_temperature_final": round(sa_temperature_final, 2)
     }
 
-    # Computation metrics
     computation_metrics = {
-        "solver_version": "9.0",
-        "algorithm": "Greedy + 2-Opt + Or-Opt + Crane-Reopt + Simulated Annealing",
+        "solver_version": "10.0",
+        "algorithm": "Greedy + 2-Opt + Or-Opt + Crane-Reopt + Simulated Annealing v10.0",
         "wall_time_s": round(wall_time, 2),
         "or_opt_improvements": oropt_improved,
         "crane_rebalance_improvements": crane_rebalance_improvements
     }
 
-    # Generate dashboard
     _generate_expert_dashboard(
         assignments, berths, vessels, cost_breakdown,
         optimization_convergence, berth_utilization, priority_analysis,
